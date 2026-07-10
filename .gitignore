@@ -1,0 +1,74 @@
+# ==========================================
+# Python Specific Boilerplate
+# ==========================================
+
+# --- Byte-compiled / optimized / DLL files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+# Poetry/Pipenv environment
+.venv
+pip-wheel-metadata/
+
+# --- Distribution / Packaging ---
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints
+
+# --- Testing / Coverage ---
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# --- Environment Secrets ---
+.env
+.env.local
+.secret
+secrets.json
+
+# --- Operating System & Common IDEs ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Project specific ignores ---
+output_graphs/
+outputs/
+original_tests/
+notes.txt
+etc/
+data/
