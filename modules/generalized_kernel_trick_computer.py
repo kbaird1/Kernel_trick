@@ -59,11 +59,21 @@ Module layout
   ordinary kernel trick, and can be unit-tested in isolation.
 * Section B -- ``ShapKernelTrickComputer``, which *composes* a
   ``KernelTrickComputer`` (all kernel / training / posterior state is read from it)
-  and adds the SHAP-specific factor builders, the public API, and an independent
-  brute-force reference used for verification.
+  and adds the SHAP-specific factor builders and the public API (first-order values,
+  and pairwise / higher-order interaction values).
 
-The mean and covariance paths are implemented and verified against the brute-force
-reference (see ``bf_*`` methods and ``test_gkt_brute.py``).
+The independent brute-force reference used to verify these paths now lives in its own
+module, ``shap_brute_force.ShapBruteForce`` (moved out of this file). It recomputes
+every SHAP quantity -- first-order and interaction -- by direct subset enumeration,
+without the polynomial layer, so agreement is genuine evidence of correctness. Build
+it from the same ``ktc`` (or straight from a ``ShapKernelTrickComputer``)::
+
+    from shap_brute_force import ShapBruteForce
+    bf = ShapBruteForce(shap=shap)      # or ShapBruteForce(ktc=ktc)
+    torch.allclose(shap.shap_values(x, pi), bf.bf_shap_values(x_oh, pi))
+
+The first-order and interaction mean/covariance paths are implemented and verified
+against that reference (see ``test_gkt_brute.py``).
 
 
 Notes on conventions
@@ -83,21 +93,26 @@ Still to do
 * KeOps / LazyTensor variant: this module is dense/torch only. A lazy path mirroring
   ``compute_LTDR_lazy`` in the kernel-trick module is still to be written for scaling
   to large sequence spaces.
-* ``shap_interaction_values``: higher-order interaction SHAP (pairwise phi_ij and
-  beyond -- 3-way, 4-way, ...). The GKT machinery generalizes directly to any order;
-  what is NOT yet decided is *which* interaction index to adopt (Shapley Interaction
-  Index, Shapley-Taylor, or Faith-Shap), since they differ in their axioms and weight
-  vectors. See the method docstring for the trade-offs. Decision pending.
 * ``shap_region``: region SHAP against a product distribution -- specified, not yet
   implemented.
 * An ML/econ-notion convenience switch (see conventions above).
+
+Implemented since v1
+--------------------
+* ``shap_interaction_values`` / ``shap_pairwise_values``: pairwise ``phi_ij`` and
+  higher-order interaction SHAP for arbitrary position tuples, via the same polynomial
+  layer (every position in the interaction set ``T`` takes the degree-0 difference
+  factor). The interaction index is the Shapley Interaction Index (SII); at ``k == 2``
+  with the SHAP normalization this reproduces the ``phi_ij`` of the notes (Section 3.4)
+  and Lundberg et al. See ``shap_interaction_values`` for the weight and normalization
+  details.
 """
 
 from __future__ import annotations
 
 import itertools
-from math import exp, lgamma
-from typing import Optional, Sequence, Tuple, Union
+from math import factorial
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -111,30 +126,44 @@ import torch
 # =============================================================================
 
 
-def g_weights(L: int, device=None, dtype=torch.float64) -> torch.Tensor:
-    """Build the SHAP weight vector ``g(s) = s! (L - s - 1)! / L!``.
+def g_weights(L: int, k: int = 1, device=None, dtype=torch.float64) -> torch.Tensor:
+    """Build the (interaction) SHAP weight vector ``g_k(s) = s! (L - k - s)! / (L - k + 1)!``.
 
     This is the vector the linear functional ``R`` contracts against: after the
     per-position polynomial product yields a coefficient vector indexed by the power
-    ``s`` of the bookkeeping variable (i.e. by ``|S|``), ``R`` maps ``w^s -> g(s)``
-    and sums, so ``R(coeffs) = coeffs . g``.
+    ``s`` of the bookkeeping variable (i.e. by ``|S|``), ``R`` maps ``w^s -> g_k(s)``
+    and sums, so ``R(coeffs) = coeffs . g_k``.
+
+    ``k`` is the interaction order (the size of the interaction set ``T``). It is the
+    Shapley Interaction Index weight (Grabisch-Roubens), which at ``k == 1`` reduces to
+    the ordinary first-order Shapley weight ``s! (L - s - 1)! / L!`` used by
+    :meth:`ShapKernelTrickComputer.shap_values`. Higher ``k`` fixes ``k`` positions in
+    ``T``, so the largest possible ``|S|`` is ``L - k`` and the vector has length
+    ``L - k + 1``.
 
     Args:
-        L: sequence length (== number of ML features). The vector has length ``L``,
-            covering ``s = 0, 1, ..., L-1`` (the largest possible ``|S|`` with ``i``
-            fixed).
+        L: sequence length (== number of ML features).
+        k: interaction order (default 1 == first-order Shapley).
         device, dtype: placement of the returned tensor. float64 by default for
-            numerical safety (the factorials cancel to O(1/L) magnitudes).
+            numerical safety (the factorials cancel to small magnitudes).
 
     Returns:
-        Tensor of shape ``(L,)`` with ``g[s] = s! (L - s - 1)! / L!``.
+        Tensor of shape ``(L - k + 1,)`` with ``g_k[s] = s! (L - k - s)! / (L - k + 1)!``.
 
     Note:
-        Uses lgamma for stability: ``log g(s) = lgamma(s+1) + lgamma(L-s) - lgamma(L+1)``.
-        Useful test identity: for any fixed ``i``, ``sum_s C(L-1, s) g(s) == 1``.
+        Uses lgamma for stability:
+        ``log g_k(s) = lgamma(s+1) + lgamma(L-k-s+1) - lgamma(L-k+2)``.
+        Useful test identity: for any fixed size-``k`` set ``T``,
+        ``sum_s C(L-k, s) g_k(s) == 1``.
     """
-    s = torch.arange(L, device=device, dtype=dtype)
-    log_g = torch.lgamma(s + 1) + torch.lgamma(L - s) - torch.lgamma(torch.tensor(L + 1.0, dtype=dtype))
+    if k < 1 or k > L:
+        raise ValueError(f"interaction order k must satisfy 1 <= k <= L (got k={k}, L={L}).")
+    s = torch.arange(L - k + 1, device=device, dtype=dtype)
+    log_g = (
+        torch.lgamma(s + 1)
+        + torch.lgamma(L - k - s + 1)
+        - torch.lgamma(torch.tensor(L - k + 2.0, dtype=dtype))
+    )
     return torch.exp(log_g)
 
 
@@ -242,20 +271,28 @@ def poly_prod_over_positions_bivariate(factors: Sequence[torch.Tensor]) -> torch
     return acc
 
 
-def apply_RxR(coeffs2: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-    """Apply ``R x R``: contract a bivariate coefficient tensor with ``g (x) g``.
+def apply_RxR(coeffs2: torch.Tensor, g: torch.Tensor, g2: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Apply ``R x R``: contract a bivariate coefficient tensor with ``g_a (x) g_b``.
 
-        (R x R)( sum_{a,b} c_{a,b} w^a w'^b ) = sum_{a,b} c_{a,b} g(a) g(b).
+        (R x R)( sum_{a,b} c_{a,b} w^a w'^b ) = sum_{a,b} c_{a,b} g_a(a) g_b(b).
+
+    The two axes may carry different weight vectors -- needed when the two sides are
+    interactions of different orders (the ``w`` axis uses ``g_{k}`` for the row tuple,
+    the ``w'`` axis uses ``g_{k'}`` for the column tuple). For the common same-order
+    case, pass a single ``g`` and it is used on both axes.
 
     Args:
         coeffs2: ``(..., Da, Db)`` bivariate coefficients.
-        g: ``(L,)`` SHAP weight vector.
+        g: weight vector for the ``w`` (row / first) axis.
+        g2: weight vector for the ``w'`` (column / second) axis; defaults to ``g``.
 
     Returns:
         ``(...,)`` tensor.
     """
+    if g2 is None:
+        g2 = g
     Da, Db = coeffs2.shape[-2], coeffs2.shape[-1]
-    return torch.einsum("...ab,a,b->...", coeffs2, g[:Da].to(coeffs2.dtype), g[:Db].to(coeffs2.dtype))
+    return torch.einsum("...ab,a,b->...", coeffs2, g[:Da].to(coeffs2.dtype), g2[:Db].to(coeffs2.dtype))
 
 
 # =============================================================================
@@ -329,7 +366,22 @@ class ShapKernelTrickComputer:
 
         # SHAP weight vector g(s); cached once since it depends only on L.
         self._g_dtype = g_dtype
-        self.g = g_weights(self.seq_length, device=self.device, dtype=g_dtype)
+        self.g = g_weights(self.seq_length, k=1, device=self.device, dtype=g_dtype)
+        # Per-order interaction weight cache g_k(s); seeded with the first-order vector.
+        self._g_cache: Dict[int, torch.Tensor] = {1: self.g}
+
+    def _g_for_order(self, k: int) -> torch.Tensor:
+        """Return (and cache) the order-``k`` interaction weight vector ``g_k``.
+
+        ``g_1`` is the first-order Shapley weight ``self.g``; higher orders are built on
+        demand from :func:`g_weights` and reused across interaction tuples of the same
+        size. See :func:`g_weights` for the exact formula.
+        """
+        g = self._g_cache.get(k)
+        if g is None:
+            g = g_weights(self.seq_length, k=k, device=self.device, dtype=self._g_dtype)
+            self._g_cache[k] = g
+        return g
 
     # ------------------------------------------------------------------ #
     # Encoding helpers
@@ -405,245 +457,6 @@ class ShapKernelTrickComputer:
         phi0 = self.base_value(pi, eta=eta)
         phi = self.shap_values(x_oh, pi, eta=eta, calc_covar=False)
         return f_x - phi0 - phi.sum()
-
-    # ================================================================== #
-    # Brute-force reference (independent verification path)
-    # ------------------------------------------------------------------ #
-    # These recompute SHAP quantities by direct subset enumeration, WITHOUT the
-    # polynomial layer, so the GKT path can be checked against an O((1+A)^L)
-    # reference on small fixtures.
-    #
-    # Independence: every method below reads only the raw cached arrays off
-    # self.ktc (site_kernels, _train_x, Qy) and enumerates -- none of them call
-    # _shap_z_mean, _mean_channels, poly_prod_over_positions, apply_R, or any other
-    # GKT machinery. Inputs are shared; computation paths are not, so agreement is
-    # genuine evidence of correctness rather than a shared-bug coincidence.
-    #
-    # Targets are one-hot (L, A) here; use target_to_onehot upstream for a string.
-    # ================================================================== #
-
-    @staticmethod
-    def _bf_g_weight(s: int, L: int) -> float:
-        """SHAP weight ``g(s) = s! (L-s-1)! / L!`` (scalar, via lgamma).
-
-        Deliberately a standalone scalar recomputation -- it does NOT read ``self.g``
-        (built by the GKT side), so the two paths share no weight vector.
-        """
-        return exp(lgamma(s + 1) + lgamma(L - s) - lgamma(L + 1))
-
-    def _bf_onehot_to_idx(self, x_onehot: torch.Tensor) -> torch.Tensor:
-        """Convert a ``(L, A)`` one-hot target to a length-``L`` LongTensor of indices."""
-        assert x_onehot.shape == (self.seq_length, self.n_alleles), \
-            f"expected one-hot (L, A)=({self.seq_length},{self.n_alleles})"
-        return x_onehot.argmax(dim=-1).long()
-
-    def bf_posterior_mean(self, z_idx: Sequence[int]) -> torch.Tensor:
-        """Posterior mean ``f(z) = sum_t (prod_p a^p_{z_p, y_{t,p}}) Qy_t`` for one sequence.
-
-        Rebuilt from the raw caches (site_kernels, _train_x, Qy) -- the same function
-        the GKT mean path explains, but evaluated pointwise for a single sequence ``z``.
-        """
-        L, A = self.seq_length, self.n_alleles
-        site = self.ktc.site_kernels                                # (L, A, A)
-        qy = self.ktc.Qy                                            # (t,)
-        Xtr = self.ktc._train_x.reshape(-1, L, A)
-        train_idx = Xtr.argmax(dim=-1)                             # (t, L)
-
-        z = torch.as_tensor(z_idx, device=self.device).long()
-        k = torch.ones(train_idx.shape[0], dtype=qy.dtype, device=qy.device)
-        for p in range(L):
-            k = k * site[p, z[p], train_idx[:, p]].to(qy.dtype)    # a^p_{z_p, y_{t,p}}
-        return (k * qy).sum()
-
-    def bf_conditional_expectation(
-        self, S: Sequence[int], x_idx: torch.Tensor, pi: torch.Tensor
-    ) -> torch.Tensor:
-        """Conditional expectation ``f_x(S) = E_pi[ f | z_p = x_p for p in S ]``.
-
-        Evaluated by enumerating all characters at the free (non-``S``) positions and
-        weighting by the background ``pi``.
-        """
-        L, A = self.seq_length, self.n_alleles
-        S = set(int(p) for p in S)
-        free = [p for p in range(L) if p not in S]
-        base = [int(c) for c in x_idx]
-        total = self.bf_posterior_mean(base).new_zeros(())        # dtype-matched accumulator
-        for combo in itertools.product(range(A), repeat=len(free)):
-            z = list(base)
-            w = 1.0
-            for p, c in zip(free, combo):
-                z[p] = c
-                w *= float(pi[p, c])
-            total = total + w * self.bf_posterior_mean(z)
-        return total
-
-    def bf_base_value(self, x_onehot: torch.Tensor, pi: torch.Tensor) -> torch.Tensor:
-        """Base value ``phi_0 = f_x(empty set) = E_pi[f]``, by enumeration."""
-        x_idx = self._bf_onehot_to_idx(x_onehot)
-        pi = pi.to(device=self.device)
-        return self.bf_conditional_expectation((), x_idx, pi)
-
-    def bf_shap_values(
-        self,
-        x_onehot: torch.Tensor,
-        pi: torch.Tensor,
-        indices: Optional[Sequence[int]] = None,
-    ) -> torch.Tensor:
-        """First-order SHAP means by direct subset enumeration (no kernel trick).
-
-            phi_i = sum_{S : i not in S} g(|S|) ( f_x(S u i) - f_x(S) ).
-
-        Args:
-            x_onehot: target as one-hot ``(L, A)``.
-            pi: background distribution ``(L, A)``, row-stochastic.
-            indices: SHAP positions; default all ``0..L-1``.
-
-        Returns:
-            ``phi`` of shape ``(len(indices),)``.
-        """
-        L, A = self.seq_length, self.n_alleles
-        x_idx = self._bf_onehot_to_idx(x_onehot)
-        pi = pi.to(device=self.device)
-        if indices is None:
-            indices = list(range(L))
-
-        out = []
-        for i in indices:
-            rest = [p for p in range(L) if p != i]
-            acc = self.bf_posterior_mean([int(c) for c in x_idx]).new_zeros(())
-            for r in range(len(rest) + 1):
-                gw = self._bf_g_weight(r, L)
-                for S in itertools.combinations(rest, r):
-                    fs = self.bf_conditional_expectation(S, x_idx, pi)
-                    fsi = self.bf_conditional_expectation(tuple(S) + (i,), x_idx, pi)
-                    acc = acc + gw * (fsi - fs)
-            out.append(acc)
-        return torch.stack(out)
-
-    def bf_local_accuracy_residual(
-        self, x_onehot: torch.Tensor, pi: torch.Tensor
-    ) -> torch.Tensor:
-        """``f(x) - phi_0 - sum_i phi_i`` (should be ~0), computed entirely by brute force."""
-        x_idx = self._bf_onehot_to_idx(x_onehot)
-        pi = pi.to(device=self.device)
-        fx = self.bf_posterior_mean([int(c) for c in x_idx])
-        phi0 = self.bf_conditional_expectation((), x_idx, pi)
-        phi = self.bf_shap_values(x_onehot, pi)
-        return fx - phi0 - phi.sum()
-
-    # ------------------------------------------------------------------ #
-    # Brute-force covariance reference (Theorem-1 style, explicit rows)
-    # ------------------------------------------------------------------ #
-    # These build the SHAP linear-functional rows m^i EXPLICITLY over the full
-    # sequence space (all A^L sequences) and assemble the posterior covariance the
-    # same way the kernel trick does:
-    #   cov = m^i K (m^j)^T - (m^i K_{*,X}) S S^T (m^j K_{*,X})^T,
-    # where S == ktc.S == covar_cache is the cached root with S S^T = Q + (Qy)(Qy)^T.
-    # No polynomial layer is used, so this independently checks _shap_R_cov + assembly.
-    #
-    # Cost is O(A^L) memory for the rows and O(A^{2L}) time for the full K m^j -- keep
-    # L VERY small.
-
-    def _bf_all_seqs_idx(self) -> torch.Tensor:
-        """All ``A^L`` sequences as an ``(A^L, L)`` LongTensor of character indices."""
-        L, A = self.seq_length, self.n_alleles
-        return torch.tensor(list(itertools.product(range(A), repeat=L)),
-                            dtype=torch.long, device=self.device)         # (A^L, L)
-
-    def _bf_shap_row(
-        self, i: int, x_idx: torch.Tensor, pi: torch.Tensor, all_idx: torch.Tensor
-    ) -> torch.Tensor:
-        """Explicit SHAP row ``m^i`` over all sequences ``z`` (see notes, section 3.3).
-
-            m^i_z = sum_{S : i not in S} g(|S|) ( mS_z(with i fixed) - mS_z(without i) )
-            mS_z  = prod_{p in S} delta_{x_p = z_p} * prod_{p not in S} pi^p_{z_p}.
-
-        Returns:
-            A vector of length ``A^L`` aligned with ``all_idx``.
-        """
-        L, A = self.seq_length, self.n_alleles
-        dtype = pi.dtype
-        N = all_idx.shape[0]
-        x_idx = x_idx.to(self.device)
-        pi = pi.to(self.device)
-
-        # delta[p, n] = 1 if z_n[p] == x_p else 0 ;  piz[p, n] = pi[p, z_n[p]]
-        z = all_idx                                                       # (N, L)
-        delta = (z == x_idx.view(1, L)).to(dtype).T                       # (L, N)
-        piz = pi[torch.arange(L).view(L, 1), z.T]                         # (L, N)
-
-        rest = [p for p in range(L) if p != i]
-        row = torch.zeros(N, dtype=dtype, device=self.device)
-        for r in range(len(rest) + 1):
-            gw = self._bf_g_weight(r, L)
-            for S in itertools.combinations(rest, r):
-                Sset = set(S)
-                # mS_z with i FIXED (S u i) and without i (S) share the product over
-                # p in S of delta and over p not in (S u i) of pi; they differ only at
-                # position i (delta_i vs pi_i).
-                base = torch.ones(N, dtype=dtype, device=self.device)
-                for p in range(L):
-                    if p in Sset:
-                        base = base * delta[p]
-                    elif p != i:
-                        base = base * piz[p]
-                # (delta_i - pi_i) * base == mS_z(S u i) - mS_z(S)
-                row = row + gw * (delta[i] - piz[i]) * base
-        return row                                                        # (N,)
-
-    def _bf_full_kernel(self, idxA: torch.Tensor, idxB: torch.Tensor) -> torch.Tensor:
-        """Product kernel between two sets of sequences (given as index tensors).
-
-            K[a, b] = prod_p a^p_{ idxA[a,p], idxB[b,p] }, read from site_kernels.
-        """
-        L = self.seq_length
-        site = self.ktc.site_kernels.to(self.ktc.comp_dtype)              # (L, A, A)
-        Ka, Kb = idxA.shape[0], idxB.shape[0]
-        K = torch.ones(Ka, Kb, dtype=site.dtype, device=self.device)
-        for p in range(L):
-            # site[p][idxA[:,p]][:, idxB[:,p]]
-            K = K * site[p][idxA[:, p]][:, idxB[:, p]]
-        return K                                                          # (Ka, Kb)
-
-    def bf_shap_covariance(
-        self,
-        x_onehot: torch.Tensor,
-        pi: torch.Tensor,
-        indices: Optional[Sequence[int]] = None,
-    ) -> torch.Tensor:
-        """Posterior covariance of the SHAP means by explicit Theorem-1 assembly.
-
-            cov[i,j] = m^i K (m^j)^T - (m^i K_{*,X}) S S^T (m^j K_{*,X})^T.
-
-        Built from explicit full-space rows ``m^i`` (no kernel trick), so it is
-        independent of ``_shap_R_cov`` / ``shap_values(calc_covar=True)``. O(A^L)
-        memory, O(A^{2L}) time -- for tiny ``L`` only.
-        """
-        L, A = self.seq_length, self.n_alleles
-        comp = self.ktc.comp_dtype
-        x_idx = self._bf_onehot_to_idx(x_onehot)
-        pi = pi.to(device=self.device, dtype=comp)
-        if indices is None:
-            indices = list(range(L))
-
-        all_idx = self._bf_all_seqs_idx()                                 # (A^L, L)
-        train_idx = self.ktc._train_x.reshape(-1, L, A).argmax(dim=-1).to(self.device)  # (t, L)
-
-        # explicit rows m^i over all sequences
-        rows = torch.stack([self._bf_shap_row(i, x_idx, pi, all_idx) for i in indices])  # (n, A^L)
-
-        # prior-kernel term:  m^i K (m^j)^T
-        K_all = self._bf_full_kernel(all_idx, all_idx)                    # (A^L, A^L)
-        R = rows @ K_all @ rows.T                                         # (n, n)
-
-        # data term:  (m^i K_{*,X}) S S^T (m^j K_{*,X})^T
-        K_sx = self._bf_full_kernel(all_idx, train_idx)                   # (A^L, t)
-        mK = rows @ K_sx                                                  # (n, t)
-        S = self.ktc.S.to(comp)                                          # (t, t) root
-        mKS = mK @ S                                                      # (n, t)
-        data = mKS @ mKS.T                                               # (n, n)
-
-        return R - data
 
     # ------------------------------------------------------------------ #
     # Per-position factor construction (the SHAP "encoding")
@@ -970,113 +783,353 @@ class ShapKernelTrickComputer:
         return torch.stack(rows, dim=0)
 
     # ------------------------------------------------------------------ #
+    # Interaction bookkeeping: resolve tuples, build rows / covariance
+    # ------------------------------------------------------------------ #
+
+    def _resolve_interactions(
+        self,
+        interactions: Optional[Sequence[Sequence[int]]],
+        order: Optional[int],
+        indices: Optional[Sequence[int]],
+    ) -> List[Tuple[int, ...]]:
+        """Normalize ``(interactions, order, indices)`` to a list of position tuples.
+
+        If ``interactions`` is given it is used directly (each entry sorted and
+        de-duplicated); otherwise every size-``order`` subset of ``indices`` (default:
+        all positions) is enumerated in ``itertools.combinations`` order. The returned
+        list defines the ordering of every downstream result vector / matrix, so callers
+        should read it back rather than assume an order.
+        """
+        L = self.seq_length
+        if interactions is not None:
+            out: List[Tuple[int, ...]] = []
+            for T in interactions:
+                Tt = tuple(sorted(set(int(p) for p in T)))
+                if len(Tt) == 0:
+                    raise ValueError("interaction tuples must be non-empty.")
+                if any(p < 0 or p >= L for p in Tt):
+                    raise ValueError(f"interaction positions must lie in [0, {L}); got {tuple(T)}.")
+                out.append(Tt)
+            return out
+        if order is None or order < 1:
+            raise ValueError("provide `interactions`, or an integer `order` >= 1.")
+        if order > L:
+            raise ValueError(f"order {order} exceeds sequence length {L}.")
+        idx = list(range(L)) if indices is None else [int(i) for i in indices]
+        return [tuple(T) for T in itertools.combinations(idx, order)]
+
+    def _shap_z_interaction(
+        self,
+        x_onehot: torch.Tensor,
+        pi: torch.Tensor,
+        eta: float,
+        interactions: Sequence[Tuple[int, ...]],
+    ) -> torch.Tensor:
+        """Build ``mK = m^T K_{*,X}`` for each interaction tuple ``T`` (raw SII weights).
+
+        Generalizes :meth:`_shap_z_mean` from a single index ``i`` to a set ``T``: every
+        position ``p in T`` takes the degree-0 difference factor ``[c1[p] - c0[p]]`` and
+        every other position the shared degree-1 factor ``[c0[p], c1[p]]``. Their
+        polynomial product over ``p`` is a ``(t, L - |T| + 1)`` coefficient tensor, which
+        ``apply_R`` contracts with the order-``|T|`` weight ``g_{|T|}``.
+
+        This is the position-factorized discrete derivative ``Delta_T f_x(S)`` summed
+        against ``g_{|T|}(|S|)`` over all ``S`` disjoint from ``T`` -- exactly the
+        interaction analog of the first-order row.
+
+        Returns:
+            ``mK`` of shape ``(len(interactions), t)``; these are the *unnormalized* SII
+            rows (the public method rescales them per the chosen normalization).
+        """
+        L = self.seq_length
+        c0, c1 = self._mean_channels(x_onehot, pi, eta)          # (L, t), (L, t)
+        rows = []
+        for T in interactions:
+            Tset = set(T)
+            g_k = self._g_for_order(len(Tset)).to(c0.dtype)
+            factors = []
+            for p in range(L):
+                if p in Tset:
+                    factors.append((c1[p] - c0[p]).unsqueeze(-1))        # (t, 1) deg 0
+                else:
+                    factors.append(torch.stack([c0[p], c1[p]], dim=-1))  # (t, 2) deg 1
+            coeffs = poly_prod_over_positions(factors)                   # (t, L-|T|+1)
+            rows.append(apply_R(coeffs, g_k))                            # (t,)
+        return torch.stack(rows, dim=0)                                  # (n, t)
+
+    def _shap_R_interaction(
+        self,
+        x_onehot: torch.Tensor,
+        pi: torch.Tensor,
+        eta: float,
+        interactions: Sequence[Tuple[int, ...]],
+    ) -> torch.Tensor:
+        """Build ``R[a, b] = m^{T_a} K m^{T_b}`` via the bivariate GKT (raw SII weights).
+
+        Generalizes :meth:`_shap_R_cov`: the per-position bivariate factor branches on
+        ``p in T_a`` (the ``w`` axis) and ``p in T_b`` (the ``w'`` axis) instead of
+        ``p == i`` / ``p == j``. It reuses the same three scalars from
+        :meth:`_cov_scalars`; the block layout is identical to the first-order case with
+        those two membership tests substituted:
+
+            p in T_a and T_b  (deg (0,0)):  [[ ff - 2 fa + aa ]]
+            p in T_a only     (deg (0,1)):  [[ fa - aa,  ff - fa ]]
+            p in T_b only     (deg (1,0)):  [[ fa - aa ], [ ff - fa ]]
+            p in neither      (deg (1,1)):  [[ aa, fa ], [ fa, ff ]]
+
+        The product over positions is contracted with ``apply_RxR`` using the two tuples'
+        weight vectors ``g_{|T_a|}`` (rows) and ``g_{|T_b|}`` (columns) -- they differ
+        when the tuples have different sizes.
+
+        Returns:
+            ``R`` of shape ``(len(interactions), len(interactions))`` (unnormalized SII).
+        """
+        L = self.seq_length
+        sc = self._cov_scalars(x_onehot, pi, eta)
+        K_ff, K_fa, K_aa = sc["K_ff"], sc["K_fa"], sc["K_aa"]     # each (L,)
+
+        # per-order weight vectors in the working dtype, cached across the (a, b) loop
+        g_by_order: Dict[int, torch.Tensor] = {}
+
+        def gord(k: int) -> torch.Tensor:
+            g = g_by_order.get(k)
+            if g is None:
+                g = self._g_for_order(k).to(K_ff.dtype)
+                g_by_order[k] = g
+            return g
+
+        def block(in_a: bool, in_b: bool, p: int) -> torch.Tensor:
+            """Minimal-degree bivariate block for position ``p`` (see method docstring)."""
+            ff, fa, aa = K_ff[p], K_fa[p], K_aa[p]
+            if in_a and in_b:            # deg (0, 0)
+                B = K_ff.new_zeros(1, 1)
+                B[0, 0] = ff - 2.0 * fa + aa
+            elif in_a:                   # deg (0, 1)
+                B = K_ff.new_zeros(1, 2)
+                B[0, 0] = fa - aa; B[0, 1] = ff - fa
+            elif in_b:                   # deg (1, 0)
+                B = K_ff.new_zeros(2, 1)
+                B[0, 0] = fa - aa; B[1, 0] = ff - fa
+            else:                        # deg (1, 1)
+                B = K_ff.new_zeros(2, 2)
+                B[0, 0] = aa; B[0, 1] = fa; B[1, 0] = fa; B[1, 1] = ff
+            return B
+
+        sets = [set(T) for T in interactions]
+        n = len(sets)
+        R = K_ff.new_zeros(n, n)
+        for a, Ta in enumerate(sets):
+            ga = gord(len(Ta))
+            for b, Tb in enumerate(sets):
+                gb = gord(len(Tb))
+                factors = [block(p in Ta, p in Tb, p) for p in range(L)]
+                coeffs2 = poly_prod_over_positions_bivariate(factors)
+                R[a, b] = apply_RxR(coeffs2, ga, gb)
+        return R
+
+    # ------------------------------------------------------------------ #
+    # Public: pairwise / higher-order interaction SHAP
+    # ------------------------------------------------------------------ #
+
+    def shap_interaction_values(
+        self,
+        x: Union[str, torch.Tensor],
+        pi: torch.Tensor,
+        interactions: Optional[Sequence[Sequence[int]]] = None,
+        order: Optional[int] = 2,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        normalize: str = "shap",
+        calc_covar: bool = False,
+        use_double: bool = True,
+    ):
+        """Pairwise and higher-order interaction SHAP (notes, Section 3.4).
+
+        Computes the interaction attribution of a position set ``T = {i_1, ..., i_k}``,
+
+            phi_T(f, x) = sum_{S : S cap T = empty} g_k(|S|) * Delta_T f_x(S),
+
+        where ``Delta_T`` is the discrete k-th derivative of the conditional expectation
+        ``f_x(S) = E_pi[ f | X_S = x_S ]``,
+
+            Delta_T f_x(S) = sum_{W subseteq T} (-1)^{|T|-|W|} f_x(S u W),
+
+        which for ``k == 2`` is the familiar four-term
+        ``f_x(S u {i,j}) - f_x(S u i) - f_x(S u j) + f_x(S)`` of the notes.
+
+        Shared machinery
+        ----------------
+        Because ``S`` and ``T`` are disjoint, ``Delta_T f_x(S)`` factorizes over
+        positions, so it is exactly the position-factorizable form the GKT exploits. The
+        implementation reuses the first-order polynomial layer unchanged; the *only*
+        change from :meth:`shap_values` is that EVERY position in ``T`` takes the
+        degree-0 difference factor ``c1[p] - c0[p]`` (first order does this for the single
+        position ``i``). See :meth:`_shap_z_interaction` / :meth:`_shap_R_interaction`.
+
+        Interaction index and weight
+        ----------------------------
+        Interactions (unlike first-order Shapley) are not unique, so a weight ``g_k(s)``
+        must be chosen. This uses the Shapley Interaction Index (SII; Grabisch-Roubens),
+
+            g_k(s) = s! (L - k - s)! / (L - k + 1)!,
+
+        which reduces to the first-order Shapley weight at ``k == 1`` (so
+        ``shap_interaction_values(order=1)`` agrees with :meth:`shap_values`) and, at
+        ``k == 2`` with the SHAP normalization below, reproduces the ``phi_ij`` written
+        in the notes and in Lundberg et al. (SII was chosen over Shapley-Taylor /
+        Faith-Shap to stay numerically comparable with those papers; the latter two add
+        an efficiency decomposition at the cost of a top-order boundary rule or a
+        cross-order least-squares solve, and can be layered on later on top of the same
+        GKT moments.)
+
+        Normalization
+        -------------
+        * ``normalize='shap'`` (default): divide an order-``k`` value by ``k!``. At
+          ``k == 2`` this is the ``1/2`` symmetrization in the notes' formula (the
+          interaction shared between ``(i, j)`` and ``(j, i)``); at ``k == 1`` it is a
+          no-op, so first-order values are unchanged. This is the convention to use for
+          the ``phi_ij`` matrix and for the "single positions + pairwise + higher-order
+          epistasis" reading.
+        * ``normalize='sii'``: return the raw SII value (no ``k!`` factor).
+
+        Args:
+            x: target sequence to explain (string over the alphabet, or one-hot ``(L, A)``).
+            pi: background distribution, row-stochastic ``(L, A)``.
+            interactions: explicit iterable of position tuples ``T`` (any orders, possibly
+                mixed). If None, all size-``order`` subsets of ``indices`` are enumerated.
+            order: interaction order to enumerate when ``interactions`` is None (default 2
+                == pairwise). Ignored when ``interactions`` is given.
+            eta: background-channel scale (see module notes on ``eta``). Default 1.0.
+            indices: universe of positions to enumerate over when ``interactions`` is None
+                (default: all positions). Ignored when ``interactions`` is given.
+            normalize: ``'shap'`` (default) or ``'sii'`` (see above).
+            calc_covar: if True, also return the posterior covariance of the interactions.
+            use_double: run the polynomial / assembly in float64 (recommended).
+
+        Returns:
+            ``(interactions, phi)`` if ``calc_covar`` is False, else
+            ``(interactions, phi, cov)``, where ``interactions`` is the resolved list of
+            tuples (defining the row/column order), ``phi`` has shape ``(n,)`` and ``cov``
+            shape ``(n, n)`` with ``n = len(interactions)``.
+
+        Verify with ``shap_brute_force.ShapBruteForce.bf_interaction_values`` /
+        ``bf_interaction_covariance`` (independent subset enumeration).
+        """
+        if normalize not in ("shap", "sii"):
+            raise ValueError("normalize must be 'shap' or 'sii'.")
+
+        # Precision: SHAP weights are near-cancelling, so float64 by default.
+        if use_double:
+            self.ktc.set_precision(use_double=True)
+        comp = self.ktc.comp_dtype
+
+        x_oh = self.target_to_onehot(x).to(comp)
+        pi = pi.to(device=self.device, dtype=comp)
+        self.ktc.validate_pis(pi)
+
+        T_list = self._resolve_interactions(interactions, order, indices)
+
+        # Unnormalized SII rows mK = m^T K_{*,X}.
+        mK = self._shap_z_interaction(x_oh, pi, eta, T_list)         # (n, t)
+
+        # Per-tuple normalization: 'shap' divides an order-k value by k! (== 1/2 at k=2,
+        # matching the notes; a no-op at k=1). 'sii' keeps the raw index.
+        if normalize == "shap":
+            scale = torch.tensor([1.0 / factorial(len(T)) for T in T_list],
+                                 device=self.device, dtype=comp)
+        else:
+            scale = torch.ones(len(T_list), device=self.device, dtype=comp)
+
+        mK = scale[:, None] * mK                                     # (n, t)
+        Qy = self.ktc.Qy.to(comp)                                    # (t,)
+        phi = mK @ Qy                                                # (n,)
+
+        if not calc_covar:
+            return T_list, phi
+
+        # Covariance: same assembly as shap_values, R and mK from the interaction GKT.
+        R = self._shap_R_interaction(x_oh, pi, eta, T_list)          # (n, n) SII
+        R = (scale[:, None] * R) * scale[None, :]                    # apply normalization
+        S = self.ktc.S.to(comp)                                      # (t, t) root
+        zS = mK @ S                                                  # (n, t)
+        cov = R - zS @ zS.T                                          # (n, n)
+        return T_list, phi, cov
+
+    def shap_pairwise_values(
+        self,
+        x: Union[str, torch.Tensor],
+        pi: torch.Tensor,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        fill_diagonal: bool = False,
+        use_double: bool = True,
+    ) -> torch.Tensor:
+        """Pairwise interaction matrix ``Phi[i, j] = phi_ij`` (notes, Section 3.4).
+
+        Convenience wrapper over :meth:`shap_interaction_values` that lays the pairwise
+        values out as a symmetric matrix. Off-diagonal entries are the notes' / Lundberg
+        pairwise SHAP interaction (``normalize='shap'`` at order 2, i.e. SII / 2), with
+        ``Phi[i, j] == Phi[j, i]``.
+
+        Args:
+            x: target sequence (string or one-hot ``(L, A)``).
+            pi: background distribution ``(L, A)``, row-stochastic.
+            eta: background-channel scale. Default 1.0.
+            indices: positions to include (default all ``L``); the matrix is indexed in
+                this order.
+            fill_diagonal: if True, set ``Phi[i, i] = phi_i - sum_{j != i} phi_ij`` from
+                the first-order values -- the Lundberg main-effect-on-diagonal convention,
+                which makes each row sum to ``phi_i`` (a convenient self-consistency
+                check). If False (default -- strictly the notes, which define only
+                ``i != j``) the diagonal is left zero.
+            use_double: run in float64.
+
+        Returns:
+            ``Phi`` of shape ``(m, m)`` with ``m = len(indices)``.
+        """
+        L = self.seq_length
+        idx = list(range(L)) if indices is None else [int(i) for i in indices]
+        pos = {p: r for r, p in enumerate(idx)}
+        m = len(idx)
+
+        pairs = list(itertools.combinations(idx, 2))
+        if pairs:
+            T_list, phi_pairs = self.shap_interaction_values(
+                x, pi, interactions=pairs, eta=eta, normalize="shap",
+                calc_covar=False, use_double=use_double,
+            )
+            Phi = phi_pairs.new_zeros(m, m)
+            for (i, j), val in zip(T_list, phi_pairs):
+                ri, rj = pos[i], pos[j]
+                Phi[ri, rj] = val
+                Phi[rj, ri] = val
+        else:
+            comp = self.ktc.comp_dtype
+            Phi = torch.zeros(m, m, device=self.device, dtype=comp)
+
+        if fill_diagonal:
+            phi_i = self.shap_values(x, pi, eta=eta, indices=idx,
+                                     calc_covar=False, use_double=use_double)  # (m,)
+            offdiag = Phi.sum(dim=1)                        # diagonal is still zero here
+            Phi[range(m), range(m)] = phi_i - offdiag
+        return Phi
+
+    # ------------------------------------------------------------------ #
     # Public: extensions (specified, not yet implemented)
     # ------------------------------------------------------------------ #
 
-    def shap_interaction_values(self, x, pi, eta: float = 1.0, calc_covar: bool = False):
-        """Higher-order interaction SHAP (pairwise phi_ij and beyond). NOT YET IMPLEMENTED.
+    # def shap_region(self, pi_star, pi, eta: float = 1.0, indices=None, calc_covar: bool = False):
+    #     """Region SHAP (notes, Section 3.4 'Extension to regions'). NOT YET IMPLEMENTED.
 
-        Only first-order phi_i (``shap_values``) is implemented and verified so far.
-        This method is intended to compute interaction attributions for a position set
-        T = {i_1, ..., i_k}: pairwise (k=2) as in the background papers, and in principle
-        3-way, 4-way, ... as well. The GKT extends to any order; the reason this is left
-        open is a *modeling* choice (which interaction index), not a machinery gap.
-
-        Shared machinery (identical for every index below)
-        ---------------------------------------------------
-        Every interaction index is built on the discrete k-th derivative of the set
-        function f_x(S) = E_pi[ f | X_S = x_S ]:
-
-            Delta_T f_x(S) = sum_{W subseteq T} (-1)^{|T|-|W|} f_x(S u W).
-
-        For k=2 this is the familiar
-            f_x(S u {i,j}) - f_x(S u i) - f_x(S u j) + f_x(S).
-        Because S and T are disjoint, Delta_T factorizes over positions:
-
-            Delta_T f_x(S)_z = prod_{p in T}       (delta_{x_p=z_p} - pi^p_{z_p})
-                             * prod_{p in S}        delta_{x_p=z_p}
-                             * prod_{p not in S u T} pi^p_{z_p}.
-
-        This is exactly the position-factorizable form the GKT already exploits. In
-        ``_shap_z_mean``, first order gives the single position i the degree-0 difference
-        factor ``c1[i] - c0[i]`` and every other position the degree-1 factor
-        ``[c0[p], c1[p]]``. For an order-k interaction, EVERY position in T gets the
-        ``c1[p] - c0[p]`` difference factor; nothing else changes. So the interaction
-
-            sum_{S : S cap T = empty} g_k(|S|) * Delta_T f_x(S)
-
-        is one GKT run, and across the candidate indices ONLY the weight vector g_k(s)
-        (plus, for some, a boundary term) differs.
-
-        Open decision: which interaction index
-        ---------------------------------------
-        First-order SHAP is unique (a theorem); interactions are NOT, so different
-        axioms yield different indices. The three standard choices, with trade-offs:
-
-        * Shapley Interaction Index (SII; Grabisch-Roubens). Natural per-T recursion,
-          symmetric across orders, weight
-              g_SII_k(s) = s! (L - k - s)! / (L - k + 1)!.
-          Downside: does NOT reconstruct the prediction (no additive / efficiency
-          decomposition). NOTE: Lundberg tree-SHAP pairwise values are SII at k=2 (with
-          a 1/2 symmetrization) -- i.e. the four-term formula above. Choose SII to stay
-          numerically comparable with those papers.
-
-        * Shapley-Taylor (STI; Sundararajan et al.). Fix a max order k: orders < k use
-          the discrete-derivative value directly, order == k absorbs the remainder via a
-          Shapley average. Gives an EXACT efficiency decomposition (all terms up to k sum
-          to f(x) - base value) -- a bounded k-th-order Taylor explanation. Downside: the
-          top order is defined differently from lower orders, and the values depend on the
-          chosen truncation k. Best fit for the "phenotype = single positions + pairwise +
-          3-way epistasis, and the terms add up" story.
-
-        * Faith-Shap (Tsai et al.). Interactions are the coefficients of the best
-          order-<=k polynomial approximation of f_x under Shapley-weighted least squares.
-          Strongest theoretical footing and also yields an efficiency decomposition.
-          Downside: newer / less widely recognized, and the weights couple across orders
-          (a least-squares solve over GKT-computable moments, not a single g_k(s) swap).
-
-        What each needs on top of the shared machinery
-        -----------------------------------------------
-        * SII, and STI's sub-top orders: supply the appropriate g_k(s); done.
-        * STI top order: one extra boundary rule for order == k.
-        * Faith-Shap: assemble the least-squares coefficients from the (GKT-computable)
-          Shapley-weighted moments -- more glue code, same primitives underneath.
-
-        Practical scoping
-        -----------------
-        Any single interaction T is cheap (polynomial in L). But there are C(L, k)
-        order-k sets, so "all interactions up to order 5" blows up combinatorially. Plan
-        to compute SELECTED tuples (or all pairs / all triples for small L) rather than
-        the full interaction tensor.
-
-        Covariance and verification
-        ----------------------------
-        Covariance generalizes ``_shap_R_cov`` by branching on ``p in T`` / ``p in T'``
-        instead of ``p == i`` / ``p == j`` (a 2^k-term difference structure); it can be
-        deferred (mean first). Verification mirrors the existing brute-force references:
-        enumerate Delta_T f_x(S) directly, independent of the polynomial layer.
-
-        The eventual signature will need an interaction set T (or an order plus
-        enumeration) and a choice of index; kept as-is until the index is chosen.
-        """
-        raise NotImplementedError(
-            "Interaction SHAP: the machinery generalizes to any order, but the "
-            "interaction index (SII / Shapley-Taylor / Faith-Shap) is not yet chosen. "
-            "See the docstring for the trade-offs."
-        )
-
-    def shap_region(self, pi_star, pi, eta: float = 1.0, indices=None, calc_covar: bool = False):
-        """Region SHAP (notes, Section 3.4 'Extension to regions'). NOT YET IMPLEMENTED.
-
-        Explain a region described by a product distribution ``pi_star`` against a
-        background ``pi``. Generalization: the fixed-channel ``a^p_{x_p, .}`` is replaced
-        by the ``pi_star``-averaged channel ``sum_c pi_star^p_c a^p_{c, .}`` (another
-        ``compute_zeta_pc`` call with ``pi_star``). Everything else -- the polynomial
-        layer, the ``w``-bookkeeping, ``apply_R`` -- is unchanged, so this is a small
-        edit to ``_mean_channels`` / ``_cov_scalars`` (swap the 'fixed' definition) once
-        the point-target path is verified.
-        """
-        raise NotImplementedError("Region SHAP is specified but not implemented in v1.")
+    #     Explain a region described by a product distribution ``pi_star`` against a
+    #     background ``pi``. Generalization: the fixed-channel ``a^p_{x_p, .}`` is replaced
+    #     by the ``pi_star``-averaged channel ``sum_c pi_star^p_c a^p_{c, .}`` (another
+    #     ``compute_zeta_pc`` call with ``pi_star``). Everything else -- the polynomial
+    #     layer, the ``w``-bookkeeping, ``apply_R`` -- is unchanged, so this is a small
+    #     edit to ``_mean_channels`` / ``_cov_scalars`` (swap the 'fixed' definition) once
+    #     the point-target path is verified.
+    #     """
+    #     raise NotImplementedError("Region SHAP is specified but not implemented in v1.")
 
 
 __all__ = [

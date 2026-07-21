@@ -1,24 +1,28 @@
 """
-test_gkt_vs_bruteforce.py
-=========================
+test_gkt_vs_bruteforce.py   (module name: test_gkt_brute)
+=========================================================
 End-to-end verification of the SHAP *mean* path in
 ``generalized_kernel_trick_computer.py`` against a brute-force reference that now
-lives ON THE SAME CLASS (``ShapKernelTrickComputer.bf_*`` methods).
+lives in its OWN module (``shap_brute_force.ShapBruteForce``, constructed from the
+SHAP computer).
 
 Both paths explain the *same* posterior-mean function (they read the same cached
 ``site_kernels`` / ``_train_x`` / ``Qy`` off the real ``KernelTrickComputer``), but
 compute by completely different routes: the GKT uses the polynomial layer, while
-the ``bf_*`` methods enumerate subsets directly. Agreement is therefore evidence
-the SHAP-mean implementation is correct rather than a modelling coincidence.
+the ``ShapBruteForce.bf_*`` methods enumerate subsets directly. Agreement is
+therefore evidence the SHAP-mean implementation is correct rather than a modelling
+coincidence.
 
 The sequence space is kept small because the brute force is O((1 + |A|)^L).
 
 Requires the same stack as the notebook: torch, epik, gpytorch, linear_operator,
 pykeops. Run:
-    python test_gkt_brute.py                       # L=4, alphabet=ABC
+    python test_gkt_brute.py                       # L=4, alphabet=ABC (CPU)
+    python test_gkt_brute.py --gpu                 # same checks, run on CUDA if available
     python test_gkt_brute.py --L 5 --alphabet ABC --targets 8
     python test_gkt_brute.py --kernel connectedness --n-iter 150
-    python test_gkt_brute.py --benchmark --bench-L-max 6   # timing/flop sweep
+    python test_gkt_brute.py --benchmark --bench-L-max 6         # timing/flop sweep (CPU)
+    python test_gkt_brute.py --benchmark --gpu --bench-L-max 6   # sweep on the GPU
 
 Exercises the mean side of the SHAP computer (g-weights, channels, mean rows,
 shap_values, indices subset, shap_values_batch, base_value, local accuracy),
@@ -28,6 +32,17 @@ With ``--benchmark`` it instead sweeps L, timing GKT vs brute-force wall-clock a
 comparing against an analytical operation-count model (exponential (1+A)^L for the
 brute force vs polynomial for the GKT), writing
 ``output/gkt_vs_bruteforce_benchmark.png``.
+
+GPU (``--gpu``)
+--------------
+Moves the fitted ``KernelTrickComputer`` and all its cached tensors onto CUDA
+*before* constructing ``ShapKernelTrickComputer`` / ``ShapBruteForce`` (both capture
+``ktc.device`` at init), then runs the same GKT and brute-force paths there. Both
+paths agree across devices, so the checks stay meaningful; the only reason to keep
+``L`` small is the brute force's O((1+A)^L) cost, which is device-independent. Timing
+is CUDA-synchronised so wall-clock reflects real kernel completion, not launch time.
+If ``--gpu`` is passed without a visible CUDA device the run falls back to CPU with a
+warning. (For a dedicated CPU-vs-GPU study of the GKT path alone, see test_gkt_gpu.py.)
 """
 
 from __future__ import annotations
@@ -68,10 +83,16 @@ print(f"Calculated ROOT_DIR:    {ROOT_DIR}")
 
 # 2. Set up paths for Python to find our internal modules
 MODULES_DIR = os.path.join(ROOT_DIR, "modules")
+
+print(f"Modules directory:     {MODULES_DIR}")
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 if MODULES_DIR not in sys.path:
     sys.path.insert(0, MODULES_DIR)
+
+# print("MODULES_DIR on sys.path? ->", MODULES_DIR in sys.path)
+# print("What Python sees in MODULES_DIR ->", 
+#       os.listdir(MODULES_DIR) if os.path.isdir(MODULES_DIR) else "DIR NOT VISIBLE")
 
 # 3. Import epik_loader and configure the epik package path.
 import epik_loader
@@ -85,15 +106,15 @@ import epik_loader
 #    NOTE: this requires kernel_trick/epik/__init__.py AND
 #    kernel_trick/epik/epik/__init__.py to both exist.
 epik_loader.ensure_epik_loaded(epik_code_root=ROOT_DIR)
-print(f"epik package loaded from: {os.path.join(ROOT_DIR, 'epik')}")
+# print(f"epik package loaded from: {os.path.join(ROOT_DIR, 'epik')}")
 print("="*50 + "\n")
 
 
 # --------------------------------------------------------------------------- #
 # epik + project-module imports
 # These MUST stay below the path configuration above: they only resolve once
-# ensure_epik_loaded() has put the right directory on sys.path. Everything SHAP
-# now comes from the single consolidated module.
+# ensure_epik_loaded() has put the right directory on sys.path. The GKT computer
+# and its brute-force reference now live in two separate modules.
 # --------------------------------------------------------------------------- #
 from epik.epik.kernel import JengaKernel, ConnectednessKernel
 from epik.epik.model import EpiK
@@ -101,6 +122,7 @@ from epik.epik.utils import encode_seqs, split_training_test
 
 from modules.kernel_trick_computer_refactored import KernelTrickComputer
 from modules.generalized_kernel_trick_computer import ShapKernelTrickComputer
+from modules.shap_brute_force import ShapBruteForce
 
 
 # =========================================================================== #
@@ -148,30 +170,80 @@ def build_real_ktc(
     return KernelTrickComputer(model, alphabet, L)
 
 
-def onehot(x_idx, A):
+def onehot(x_idx, A, device=None):
+    """One-hot encode a length-L index sequence to an ``(L, A)`` float64 tensor.
+
+    ``device`` places the result (default CPU); callers that run on the GPU pass the
+    target device so targets/pi live alongside the moved ``ktc`` caches.
+    """
     L = len(x_idx)
-    oh = torch.zeros(L, A, dtype=DT)
-    oh[torch.arange(L), torch.as_tensor(x_idx)] = 1.0
+    oh = torch.zeros(L, A, dtype=DT, device=device)
+    oh[torch.arange(L, device=device), torch.as_tensor(x_idx, device=device)] = 1.0
     return oh
 
 
 # =========================================================================== #
-# Verification battery  (GKT mean path vs. the class's own bf_* reference)
+# Device placement
 # =========================================================================== #
 
-def run_checks(ktc, n_targets=8, seed=0, atol=1e-6):
+def move_ktc_to_device(ktc, device):
+    """Move a ``KernelTrickComputer``'s model + all cached tensors onto ``device``.
+
+    Must run BEFORE constructing ``ShapKernelTrickComputer`` / ``ShapBruteForce``:
+    both capture ``ktc.device`` at init (and the GKT builds ``self.g`` there), and
+    ``ShapBruteForce`` allocates its enumeration tensors on ``ktc.device``. Some GKT
+    paths cast cached tensors with ``.to(dtype)`` only (no device move), so every
+    tensor attribute on ``ktc`` must already be on the right device. Returns the list
+    of moved attribute names.
+    """
+    if hasattr(ktc, "model") and hasattr(ktc.model, "to"):
+        try:
+            ktc.model = ktc.model.to(device)
+        except Exception as e:  # noqa: BLE001 -- best effort; GKT uses cached tensors
+            print(f"  [note] could not move live model to {device}: {e}")
+
+    moved = []
+    for name, val in list(vars(ktc).items()):
+        if torch.is_tensor(val):
+            setattr(ktc, name, val.to(device))
+            moved.append(name)
+
+    ktc.device = device
+    return moved
+
+
+def resolve_device(want_gpu: bool) -> str:
+    """Return 'cuda' if the GPU was requested AND available, else 'cpu' (with a warning)."""
+    if not want_gpu:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    print("[warn] --gpu requested but no CUDA device is visible; running on CPU. "
+          "Are you inside a GPU allocation (srun ... --gres=gpu:1)?")
+    return "cpu"
+
+
+# =========================================================================== #
+# Verification battery  (GKT mean path vs. the ShapBruteForce reference)
+# =========================================================================== #
+
+def run_checks(ktc, n_targets=8, seed=0, atol=1e-6, device="cpu"):
+    if device != "cpu":
+        move_ktc_to_device(ktc, device)         # place caches before building computers
     ktc.set_precision(use_double=True)          # exact float64 for both methods
-    shap = ShapKernelTrickComputer(ktc=ktc)     # GKT + brute-force both live here
+    shap = ShapKernelTrickComputer(ktc=ktc)     # GKT (polynomial) path
+    bf = ShapBruteForce(shap)                   # enumeration reference (own module)
 
     L, A, alphabet = ktc.seq_length, ktc.n_alleles, ktc.alphabet
+    dev = torch.device(device)
 
-    gen = torch.Generator().manual_seed(seed + 1)
+    gen = torch.Generator().manual_seed(seed + 1)   # CPU generator; move samples after
     pi = torch.rand(L, A, generator=gen, dtype=DT)
-    pi = pi / pi.sum(dim=1, keepdim=True)
+    pi = (pi / pi.sum(dim=1, keepdim=True)).to(dev)
 
     all_seqs = list(itertools.product(range(A), repeat=L))
     tsel = torch.randperm(len(all_seqs), generator=gen)[:n_targets].tolist()
-    targets = [torch.tensor(all_seqs[i]) for i in tsel]
+    targets = [torch.tensor(all_seqs[i]) for i in tsel]   # index rows (CPU); onehot places them
 
     report = []
 
@@ -185,7 +257,7 @@ def run_checks(ktc, n_targets=8, seed=0, atol=1e-6):
           f"value={ident:.12f}")
 
     # 2. channels have the right shape
-    c0, c1 = shap._mean_channels(onehot(targets[0], A), pi, 1.0)
+    c0, c1 = shap._mean_channels(onehot(targets[0], A, device=dev), pi, 1.0)
     t = ktc._train_x.reshape(-1, L, A).shape[0]
     check("_mean_channels shapes (L, t)", c0.shape == (L, t) and c1.shape == (L, t),
           f"c0={tuple(c0.shape)}, c1={tuple(c1.shape)}, t={t}")
@@ -193,9 +265,9 @@ def run_checks(ktc, n_targets=8, seed=0, atol=1e-6):
     # 3. shap_values (GKT) vs brute force, over all targets  (the core check)
     gkt_all, bf_all = [], []
     for x_idx in targets:
-        x_oh = onehot(x_idx, A)
+        x_oh = onehot(x_idx, A, device=dev)
         gkt_all.append(shap.shap_values(x_oh, pi))
-        bf_all.append(shap.bf_shap_values(x_oh, pi))
+        bf_all.append(bf.bf_shap_values(x_oh, pi))
     gkt_all = torch.stack(gkt_all); bf_all = torch.stack(bf_all)
     max_err = float((gkt_all - bf_all).abs().max())
     check("shap_values == brute force (all targets)", max_err < atol,
@@ -203,29 +275,29 @@ def run_checks(ktc, n_targets=8, seed=0, atol=1e-6):
 
     # 4. indices subset matches the full computation
     idx = list(range(0, L, 2))
-    sub = shap.shap_values(onehot(targets[0], A), pi, indices=idx)
-    full = shap.shap_values(onehot(targets[0], A), pi)
+    sub = shap.shap_values(onehot(targets[0], A, device=dev), pi, indices=idx)
+    full = shap.shap_values(onehot(targets[0], A, device=dev), pi)
     check("indices subset matches full", torch.allclose(sub, full[idx], atol=atol),
           f"idx={idx}")
 
     # 5. shap_values_batch == per-target loop
-    xs = [onehot(x, A) for x in targets[:4]]
+    xs = [onehot(x, A, device=dev) for x in targets[:4]]
     batched = shap.shap_values_batch(xs, pi)
     looped = torch.stack([shap.shap_values(x, pi) for x in xs])
     check("shap_values_batch == loop", torch.allclose(batched, looped, atol=atol))
 
     # 6. base_value (GKT) == brute-force base value == E_pi[f]
     phi0 = float(shap.base_value(pi))
-    phi0_bf = float(shap.bf_base_value(onehot(targets[0], A), pi))
+    phi0_bf = float(bf.bf_base_value(onehot(targets[0], A, device=dev), pi))
     check("base_value == E_pi[f]", abs(phi0 - phi0_bf) < atol,
           f"gkt={phi0:.6f}, bf={phi0_bf:.6f}")
 
     # 7. local accuracy: f(x) == phi0 + sum_i phi_i   (GKT diagnostic)
-    la = float(shap.local_accuracy_residual(onehot(targets[0], A), pi))
+    la = float(shap.local_accuracy_residual(onehot(targets[0], A, device=dev), pi))
     check("local_accuracy_residual ~ 0 (GKT)", abs(la) < 1e-5, f"residual={la:.2e}")
 
     # 8. local accuracy via the independent brute-force path
-    la_bf = float(shap.bf_local_accuracy_residual(onehot(targets[0], A), pi))
+    la_bf = float(bf.bf_local_accuracy_residual(onehot(targets[0], A, device=dev), pi))
     check("local_accuracy_residual ~ 0 (brute force)", abs(la_bf) < 1e-5,
           f"residual={la_bf:.2e}")
 
@@ -235,9 +307,9 @@ def run_checks(ktc, n_targets=8, seed=0, atol=1e-6):
     #    explicit full-space rows. Independent paths -> agreement is real evidence.
     cov_gkt_all, cov_bf_all = [], []
     for x_idx in targets:
-        x_oh = onehot(x_idx, A)
+        x_oh = onehot(x_idx, A, device=dev)
         _, cg = shap.shap_values(x_oh, pi, calc_covar=True)
-        cb = shap.bf_shap_covariance(x_oh, pi)
+        cb = bf.bf_shap_covariance(x_oh, pi)
         cov_gkt_all.append(cg); cov_bf_all.append(cb)
     cov_gkt_all = torch.stack(cov_gkt_all); cov_bf_all = torch.stack(cov_bf_all)
     cov_max_err = float((cov_gkt_all - cov_bf_all).abs().max())
@@ -248,9 +320,13 @@ def run_checks(ktc, n_targets=8, seed=0, atol=1e-6):
     sym_err = float((cov_gkt_all - cov_gkt_all.transpose(-1, -2)).abs().max())
     check("GKT covariance symmetric", sym_err < atol, f"max asym={sym_err:.2e}")
 
-    return dict(report=report, gkt=gkt_all, bf=bf_all, targets=targets,
-                pi=pi, L=L, A=A, alphabet=alphabet, t=t, max_err=max_err,
-                cov_gkt=cov_gkt_all, cov_bf=cov_bf_all, cov_max_err=cov_max_err)
+    # Move everything the plot/report touches back to CPU (numpy needs host tensors).
+    return dict(report=report,
+                gkt=gkt_all.detach().cpu(), bf=bf_all.detach().cpu(),
+                targets=targets, pi=pi.detach().cpu(),
+                L=L, A=A, alphabet=alphabet, t=t, max_err=max_err, device=device,
+                cov_gkt=cov_gkt_all.detach().cpu(), cov_bf=cov_bf_all.detach().cpu(),
+                cov_max_err=cov_max_err)
 
 
 # =========================================================================== #
@@ -322,8 +398,9 @@ def make_plot(res, out_dir):
     else:
         ax.axis("off")
 
+    dev_note = f"  [device: {res.get('device', 'cpu')}]"
     plt.suptitle("GKT vs brute-force SHAP: mean + covariance "
-                 "(real KernelTrickComputer, simulated EpiK model)",
+                 "(real KernelTrickComputer, simulated EpiK model)" + dev_note,
                  fontsize=14, fontweight="bold", y=1.00)
     plt.tight_layout()
     plt.savefig(out, bbox_inches="tight")
@@ -341,7 +418,7 @@ def make_plot(res, out_dir):
 # =========================================================================== #
 
 def flops_bruteforce(L: int, A: int, t: int, n_indices: int = None) -> float:
-    """Op-count for the brute-force SHAP mean (bf_shap_values).
+    """Op-count for the brute-force SHAP mean (ShapBruteForce.bf_shap_values).
 
     phi_i = sum_{S subset of the other L-1 positions} g(|S|)(f_x(S u i) - f_x(S)).
     A conditional expectation over `free` free positions visits A^free sequence
@@ -391,53 +468,68 @@ def flops_gkt(L: int, A: int, t: int, n_indices: int = None) -> float:
 # Benchmark: GKT vs brute force across a sweep of L
 # =========================================================================== #
 
-def _time_call(fn, repeats: int, warmup: int = 1) -> float:
+def _time_call(fn, repeats: int, warmup: int = 1, device: str = "cpu") -> float:
     """Best-of-`repeats` wall-clock seconds for `fn` (after `warmup` untimed calls).
 
     Best-of (min) is used rather than mean: it is the least contaminated by OS
-    scheduling / GC pauses, and we want the intrinsic cost, not the noise.
+    scheduling / GC pauses, and we want the intrinsic cost, not the noise. On CUDA we
+    synchronise around each timed call, because kernel launches are asynchronous and
+    ``perf_counter`` alone would measure launch time, not completion.
     """
+    is_cuda = torch.device(device).type == "cuda"
     for _ in range(warmup):
         fn()
+    if is_cuda:
+        torch.cuda.synchronize()
     best = float("inf")
     for _ in range(repeats):
+        if is_cuda:
+            torch.cuda.synchronize()
         t0 = perf_counter()
         fn()
+        if is_cuda:
+            torch.cuda.synchronize()
         best = min(best, perf_counter() - t0)
     return best
 
 
 def run_benchmark(L_values, alphabet="ABC", ptrain=0.5, n_iter=60,
-                  kernel="jenga", targets=3, seed=0, repeats=5):
+                  kernel="jenga", targets=3, seed=0, repeats=5, device="cpu"):
     """Sweep L; for each, fit a model and time GKT vs brute-force SHAP means.
 
     Returns a dict of parallel lists suitable for make_benchmark_plot. Records both
     measured wall-clock (median-of-targets, best-of-repeats per target) and the
-    analytical op-counts for GKT and brute force.
+    analytical op-counts for GKT and brute force. With ``device='cuda'`` both paths
+    run (and are timed, synchronised) on the GPU.
     """
     A = len(set(alphabet))
+    dev = torch.device(device)
     rows = []
-    print(f"\n{'L':>3} {'t':>5} {'GKT (ms)':>12} {'BF (ms)':>12} "
+    print(f"\n[device: {device}]")
+    print(f"{'L':>3} {'t':>5} {'GKT (ms)':>12} {'BF (ms)':>12} "
           f"{'speedup':>10} {'GKT flops':>12} {'BF flops':>12}")
     for L in L_values:
         ktc = build_real_ktc(L=L, alphabet=alphabet, ptrain=ptrain,
                              n_iter=n_iter, seed=seed, kernel=kernel)
+        if device != "cpu":
+            move_ktc_to_device(ktc, device)
         ktc.set_precision(use_double=True)
         shap = ShapKernelTrickComputer(ktc=ktc)
+        bf = ShapBruteForce(shap)
         t = ktc._train_x.reshape(-1, L, A).shape[0]
 
         gen = torch.Generator().manual_seed(seed + 1)
         pi = torch.rand(L, A, generator=gen, dtype=DT)
-        pi = pi / pi.sum(dim=1, keepdim=True)
+        pi = (pi / pi.sum(dim=1, keepdim=True)).to(dev)
         all_seqs = list(itertools.product(range(A), repeat=L))
         tsel = torch.randperm(len(all_seqs), generator=gen)[:targets].tolist()
-        xs = [onehot(torch.tensor(all_seqs[i]), A) for i in tsel]
+        xs = [onehot(torch.tensor(all_seqs[i]), A, device=dev) for i in tsel]
 
         # time per target, take the median target to represent "typical" cost
         gkt_times, bf_times = [], []
         for x_oh in xs:
-            gkt_times.append(_time_call(lambda: shap.shap_values(x_oh, pi), repeats))
-            bf_times.append(_time_call(lambda: shap.bf_shap_values(x_oh, pi), repeats))
+            gkt_times.append(_time_call(lambda: shap.shap_values(x_oh, pi), repeats, device=device))
+            bf_times.append(_time_call(lambda: bf.bf_shap_values(x_oh, pi), repeats, device=device))
         gkt_s = sorted(gkt_times)[len(gkt_times) // 2]
         bf_s = sorted(bf_times)[len(bf_times) // 2]
 
@@ -449,7 +541,7 @@ def run_benchmark(L_values, alphabet="ABC", ptrain=0.5, n_iter=60,
               f"{bf_s/gkt_s:>9.1f}x {fl_gkt:>12.2e} {fl_bf:>12.2e}")
 
     return dict(
-        A=A, targets=targets,
+        A=A, targets=targets, device=device,
         L=[r["L"] for r in rows], t=[r["t"] for r in rows],
         gkt_s=[r["gkt_s"] for r in rows], bf_s=[r["bf_s"] for r in rows],
         fl_gkt=[r["fl_gkt"] for r in rows], fl_bf=[r["fl_bf"] for r in rows],
@@ -469,7 +561,7 @@ def make_benchmark_plot(bench, out_dir):
     ax.plot(L, [s * 1e3 for s in bench["gkt_s"]], "o-", color="#2b5c8f", label="GKT")
     ax.set_yscale("log"); ax.set_xticks(L)
     ax.set_xlabel("L (sequence length)"); ax.set_ylabel("wall-clock per target (ms, log)")
-    ax.set_title("Measured runtime"); ax.legend()
+    ax.set_title(f"Measured runtime  [{bench.get('device', 'cpu')}]"); ax.legend()
 
     # (2) analytical op-count, log-y  (the clean scaling story)
     ax = axes[1]
@@ -491,7 +583,8 @@ def make_benchmark_plot(bench, out_dir):
     ax.set_title("Speedup"); ax.legend()
 
     plt.suptitle(f"GKT vs brute-force: exponential -> polynomial "
-                 f"(A={bench['A']}, targets={bench['targets']})",
+                 f"(A={bench['A']}, targets={bench['targets']}, "
+                 f"device={bench.get('device', 'cpu')})",
                  fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
     plt.savefig(out, bbox_inches="tight")
@@ -512,6 +605,10 @@ def main():
     ap.add_argument("--targets", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--gpu", action="store_true",
+                    help="run the GKT and brute-force paths on CUDA if a GPU is visible "
+                         "(falls back to CPU with a warning otherwise). Applies to both "
+                         "the verification battery and --benchmark.")
     # Benchmark options
     ap.add_argument("--benchmark", action="store_true",
                     help="run the GKT-vs-brute-force timing/flop sweep over L")
@@ -521,6 +618,13 @@ def main():
     ap.add_argument("--bench-targets", type=int, default=3)
     ap.add_argument("--bench-repeats", type=int, default=5)
     args = ap.parse_args()
+
+    # Resolve the compute device once, up front.
+    device = resolve_device(args.gpu)
+    if device == "cuda":
+        print(f"device: cuda ({torch.cuda.get_device_name(0)})")
+    else:
+        print("device: cpu")
 
     # Output directory: tests/output/ (this file lives in tests/).
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -541,6 +645,7 @@ def main():
             L_values, alphabet=args.alphabet, ptrain=args.ptrain,
             n_iter=args.n_iter, kernel=args.kernel,
             targets=args.bench_targets, seed=args.seed, repeats=args.bench_repeats,
+            device=device,
         )
         if not args.no_plot:
             make_benchmark_plot(bench, out_dir)
@@ -552,9 +657,10 @@ def main():
     ktc = build_real_ktc(L=args.L, alphabet=args.alphabet, ptrain=args.ptrain,
                          n_iter=args.n_iter, seed=args.seed, kernel=args.kernel)
 
-    res = run_checks(ktc, n_targets=args.targets, seed=args.seed)
+    res = run_checks(ktc, n_targets=args.targets, seed=args.seed, device=device)
 
-    print(f"\nconfig: L={res['L']}, A={res['A']}, t={res['t']}, targets={args.targets}\n")
+    print(f"\nconfig: L={res['L']}, A={res['A']}, t={res['t']}, "
+          f"targets={args.targets}, device={res['device']}\n")
     all_pass = True
     for name, ok, detail in res["report"]:
         flag = "PASS" if ok else "FAIL"
