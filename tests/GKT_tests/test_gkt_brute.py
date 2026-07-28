@@ -2,16 +2,15 @@
 test_gkt_vs_bruteforce.py   (module name: test_gkt_brute)
 =========================================================
 End-to-end verification of the SHAP *mean* path in
-``generalized_kernel_trick_computer.py`` against a brute-force reference that now
-lives in its OWN module (``shap_brute_force.ShapBruteForce``, constructed from the
-SHAP computer).
+``shap_kernel_trick_computer.py`` against a brute-force reference that lives in its
+OWN module (``shap_brute_force.ShapBruteForce``, constructed from the SHAP computer).
 
 Both paths explain the *same* posterior-mean function (they read the same cached
 ``site_kernels`` / ``_train_x`` / ``Qy`` off the real ``KernelTrickComputer``), but
-compute by completely different routes: the GKT uses the polynomial layer, while
-the ``ShapBruteForce.bf_*`` methods enumerate subsets directly. Agreement is
-therefore evidence the SHAP-mean implementation is correct rather than a modelling
-coincidence.
+compute by completely different routes: the GKT uses the polynomial layer (imported
+from ``generalized_kernel_trick``), while the ``ShapBruteForce.bf_*`` methods enumerate
+subsets directly. Agreement is therefore evidence the SHAP-mean implementation is
+correct rather than a modelling coincidence.
 
 The sequence space is kept small because the brute force is O((1 + |A|)^L).
 
@@ -32,6 +31,14 @@ With ``--benchmark`` it instead sweeps L, timing GKT vs brute-force wall-clock a
 comparing against an analytical operation-count model (exponential (1+A)^L for the
 brute force vs polynomial for the GKT), writing
 ``output/gkt_vs_bruteforce_benchmark.png``.
+
+Module layout note
+------------------
+The GKT/SHAP code was split into two modules: ``generalized_kernel_trick`` (the reusable
+polynomial layer) and ``shap_kernel_trick_computer`` (``ShapKernelTrickComputer``). This
+file imports the computer from the latter; the old ``generalized_kernel_trick_computer``
+shim has been removed. Sibling tests (``test_gkt_gpu.py``, ``test_gkt_interactions.py``)
+import the computer *through this module's namespace*, so they needed no change.
 
 GPU (``--gpu``)
 --------------
@@ -77,8 +84,10 @@ print("\n" + "="*50)
 print("DEBUGGING & CONFIGURING PATHS")
 print("="*50)
 
-# 1. Find the project root directory ('kernel_trick')
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# 1. Find the project root directory ('kernel_trick').
+#    This file now lives in tests/GKT_tests/, so the root is TWO levels up
+#    (../../). If you move this file, adjust the number of ".." accordingly.
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 print(f"Calculated ROOT_DIR:    {ROOT_DIR}")
 
 # 2. Set up paths for Python to find our internal modules
@@ -89,10 +98,6 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 if MODULES_DIR not in sys.path:
     sys.path.insert(0, MODULES_DIR)
-
-# print("MODULES_DIR on sys.path? ->", MODULES_DIR in sys.path)
-# print("What Python sees in MODULES_DIR ->", 
-#       os.listdir(MODULES_DIR) if os.path.isdir(MODULES_DIR) else "DIR NOT VISIBLE")
 
 # 3. Import epik_loader and configure the epik package path.
 import epik_loader
@@ -106,7 +111,6 @@ import epik_loader
 #    NOTE: this requires kernel_trick/epik/__init__.py AND
 #    kernel_trick/epik/epik/__init__.py to both exist.
 epik_loader.ensure_epik_loaded(epik_code_root=ROOT_DIR)
-# print(f"epik package loaded from: {os.path.join(ROOT_DIR, 'epik')}")
 print("="*50 + "\n")
 
 
@@ -114,14 +118,15 @@ print("="*50 + "\n")
 # epik + project-module imports
 # These MUST stay below the path configuration above: they only resolve once
 # ensure_epik_loaded() has put the right directory on sys.path. The GKT computer
-# and its brute-force reference now live in two separate modules.
+# now lives in shap_kernel_trick_computer; its polynomial layer is in
+# generalized_kernel_trick; the brute-force reference is in shap_brute_force.
 # --------------------------------------------------------------------------- #
 from epik.epik.kernel import JengaKernel, ConnectednessKernel
 from epik.epik.model import EpiK
 from epik.epik.utils import encode_seqs, split_training_test
 
 from modules.kernel_trick_computer_refactored import KernelTrickComputer
-from modules.generalized_kernel_trick_computer import ShapKernelTrickComputer
+from modules.shap_kernel_trick_computer import ShapKernelTrickComputer
 from modules.shap_brute_force import ShapBruteForce
 
 

@@ -1,18 +1,21 @@
 """
-generalized_kernel_trick_computer.py
-====================================
+shap_kernel_trick_computer.py
+=============================
 
 Compute **SHAP values** (with their full posterior uncertainty) for a
 sequence-function map learned by a factorized-kernel Gaussian process, using the
 *generalized kernel trick* (GKT).
 
-This module is the SHAP counterpart to ``kernel_trick_computer_refactored.py`` and
-is used the same way on genotype->phenotype data: build a computer from a fitted
-EpiK GP model, then ask it for the SHAP attribution of a target sequence against a
-background distribution ``pi``.
+This module is the SHAP consumer of the reusable GKT polynomial layer in
+``generalized_kernel_trick.py`` (which holds the model-independent primitives
+``g_weights``, ``poly_prod_over_positions`` (+ bivariate), ``apply_R`` / ``apply_RxR``).
+It is the SHAP counterpart to ``kernel_trick_computer_refactored.py`` and is used the
+same way on genotype->phenotype data: build a computer from a fitted EpiK GP model, then
+ask it for the SHAP attribution of a target sequence against a background distribution
+``pi``.
 
     from kernel_trick_computer_refactored import KernelTrickComputer
-    from generalized_kernel_trick_computer import ShapKernelTrickComputer
+    from shap_kernel_trick_computer import ShapKernelTrickComputer
 
     ktc  = KernelTrickComputer(model, alphabet, seq_length)
     shap = ShapKernelTrickComputer(ktc=ktc)
@@ -53,20 +56,20 @@ variables and the functional ``R x R``.
 
 Module layout
 -------------
-* Section A -- standalone polynomial primitives (pure functions, model-independent):
-  ``g_weights``, ``poly_prod_over_positions`` (+ bivariate), ``apply_R`` /
-  ``apply_RxR``. This "polynomial layer" is the entire conceptual addition over the
-  ordinary kernel trick, and can be unit-tested in isolation.
-* Section B -- ``ShapKernelTrickComputer``, which *composes* a
-  ``KernelTrickComputer`` (all kernel / training / posterior state is read from it)
-  and adds the SHAP-specific factor builders and the public API (first-order values,
-  and pairwise / higher-order interaction values).
+The GKT "polynomial layer" -- the standalone, model-independent primitives (``g_weights``,
+``poly_prod_over_positions`` (+ bivariate), ``apply_R`` / ``apply_RxR``) -- now lives in
+its own module, ``generalized_kernel_trick.py``, and is imported below. That layer is the
+entire conceptual addition over the ordinary kernel trick, and can be unit-tested in
+isolation. This module holds ``ShapKernelTrickComputer``, which *composes* a
+``KernelTrickComputer`` (all kernel / training / posterior state is read from it) and adds
+the SHAP-specific factor builders and the public API (first-order values, and pairwise /
+higher-order interaction values).
 
-The independent brute-force reference used to verify these paths now lives in its own
-module, ``shap_brute_force.ShapBruteForce`` (moved out of this file). It recomputes
-every SHAP quantity -- first-order and interaction -- by direct subset enumeration,
-without the polynomial layer, so agreement is genuine evidence of correctness. Build
-it from the same ``ktc`` (or straight from a ``ShapKernelTrickComputer``)::
+The independent brute-force reference used to verify these paths lives in its own module,
+``shap_brute_force.ShapBruteForce``. It recomputes every SHAP quantity -- first-order and
+interaction -- by direct subset enumeration, without the polynomial layer, so agreement is
+genuine evidence of correctness. Build it from the same ``ktc`` (or straight from a
+``ShapKernelTrickComputer``)::
 
     from shap_brute_force import ShapBruteForce
     bf = ShapBruteForce(shap=shap)      # or ShapBruteForce(ktc=ktc)
@@ -106,197 +109,70 @@ Implemented since v1
   with the SHAP normalization this reproduces the ``phi_ij`` of the notes (Section 3.4)
   and Lundberg et al. See ``shap_interaction_values`` for the weight and normalization
   details.
+
+Added in v2 (dividends, global summaries, Faith-Shap stub)
+----------------------------------------------------------
+* ``dividend_values``: Harsanyi dividends ``a(T) = Delta_T f_x(empty)`` for arbitrary
+  position tuples (mean + optional posterior covariance). This is full-order
+  (``ell == L``) Faith-Shap -- the *pure* interaction that does not smear higher-order
+  epistasis onto its subsets -- computed by the same polynomial layer with the R-weight
+  swapped to ``[1, 0, 0, ...]`` (keep only the empty context ``S``). Verified against
+  ``ShapBruteForce.bf_dividend_values`` / ``bf_dividend_covariance``.
+* ``dividend_values_batch``, ``global_shap_importance``, ``global_dividend_summary``:
+  global (dataset-level) summaries. Averaging ``|phi_i|`` / ``|a(T)|`` over a target
+  sample gives model-level importance; the variance of ``a(T)`` over targets drawn from a
+  product background ``pi`` is the (unnormalized) Sobol sensitivity index for ``T`` (see
+  ``global_dividend_summary`` for the precise precondition).
+* ``faith_shap_values``: truncated (``ell < L``) Faith-Shap -- SPECIFIED, NOT YET
+  IMPLEMENTED (its exact redistribution weights need transcribing/testing against Tsai et
+  al. 2023 first, so it raises rather than guessing).
+
+Choosing an interaction index
+-----------------------------
+All the interaction quantities are the same position-factorized GKT moment collapsed by a
+different weight vector (see ``_index_weight_fn``); pick by the question you are asking.
+
+* ``shap_values`` (first-order Shapley): "how much does each single position contribute to
+  *this* prediction ``f(x)``, fairly divided?" The unique attribution with local accuracy
+  (the ``phi_i`` sum to ``f(x) - phi_0``).
+* ``dividend_values`` (Harsanyi dividend == full-order Faith-Shap): "which position-*sets*
+  are *irreducibly* epistatic?" ``a(T)`` is the pure joint effect -- a genuine 3-way effect
+  contributes to its triple and to *nothing* smaller. Equals the functional-ANOVA
+  component ``f_T`` under a product-``pi`` background at ``eta == 1``. NOT efficient (no
+  per-order sum to ``f(x) - phi_0``); note the order-1 dividend ``a({i}) = f_x(i) -
+  f_x(empty)`` is the ANOVA *main effect*, which differs from the Shapley value ``phi_i``.
+* ``shap_interaction_values`` (SII / Lundberg): "non-additivity, in numbers comparable to
+  the SHAP-interaction literature." It *averages* the discrete derivative over all contexts
+  ``S``, which *smears* a true order-``m`` effect down onto all its lower-order subsets. Do
+  not read its pairwise matrix as "pure pairwise epistasis" when high-order epistasis is
+  present -- a single triplet lights up all three of its pairs. Use ``dividend_values`` for
+  the clean reading.
+* ``faith_shap_values`` (truncated Faith-Shap, ``ell < L``): "an *efficient* explanation
+  using only interactions up to order ``ell``." Exact (== dividends) when the model's true
+  maximum interaction order is ``<= ell``; otherwise it redistributes the higher-order
+  epistasis into the ``<= ell`` terms (a different smearing than SII). STUB.
 """
 
 from __future__ import annotations
 
 import itertools
 from math import factorial
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-
-# =============================================================================
-# SECTION A -- Polynomial primitives (pure, model-independent functions)
-# -----------------------------------------------------------------------------
-# The "polynomial layer" that replaces the scalar ``torch.prod(..., dim=positions)``
-# of the ordinary kernel trick. Each per-position factor is a coefficient vector in
-# the bookkeeping variable(s), so the reduction over positions is a convolution.
-# =============================================================================
-
-
-def g_weights(L: int, k: int = 1, device=None, dtype=torch.float64) -> torch.Tensor:
-    """Build the (interaction) SHAP weight vector ``g_k(s) = s! (L - k - s)! / (L - k + 1)!``.
-
-    This is the vector the linear functional ``R`` contracts against: after the
-    per-position polynomial product yields a coefficient vector indexed by the power
-    ``s`` of the bookkeeping variable (i.e. by ``|S|``), ``R`` maps ``w^s -> g_k(s)``
-    and sums, so ``R(coeffs) = coeffs . g_k``.
-
-    ``k`` is the interaction order (the size of the interaction set ``T``). It is the
-    Shapley Interaction Index weight (Grabisch-Roubens), which at ``k == 1`` reduces to
-    the ordinary first-order Shapley weight ``s! (L - s - 1)! / L!`` used by
-    :meth:`ShapKernelTrickComputer.shap_values`. Higher ``k`` fixes ``k`` positions in
-    ``T``, so the largest possible ``|S|`` is ``L - k`` and the vector has length
-    ``L - k + 1``.
-
-    Args:
-        L: sequence length (== number of ML features).
-        k: interaction order (default 1 == first-order Shapley).
-        device, dtype: placement of the returned tensor. float64 by default for
-            numerical safety (the factorials cancel to small magnitudes).
-
-    Returns:
-        Tensor of shape ``(L - k + 1,)`` with ``g_k[s] = s! (L - k - s)! / (L - k + 1)!``.
-
-    Note:
-        Uses lgamma for stability:
-        ``log g_k(s) = lgamma(s+1) + lgamma(L-k-s+1) - lgamma(L-k+2)``.
-        Useful test identity: for any fixed size-``k`` set ``T``,
-        ``sum_s C(L-k, s) g_k(s) == 1``.
-    """
-    if k < 1 or k > L:
-        raise ValueError(f"interaction order k must satisfy 1 <= k <= L (got k={k}, L={L}).")
-    s = torch.arange(L - k + 1, device=device, dtype=dtype)
-    log_g = (
-        torch.lgamma(s + 1)
-        + torch.lgamma(L - k - s + 1)
-        - torch.lgamma(torch.tensor(L - k + 2.0, dtype=dtype))
-    )
-    return torch.exp(log_g)
-
-
-def _poly_mul_1d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Convolve two coefficient tensors along their last (degree) axis.
-
-    Computes the polynomial product ``out(w) = a(w) * b(w)`` where the last axis of
-    each input holds coefficients ``[c0, c1, ...]`` of ``w^0, w^1, ...``. All leading
-    axes are treated as batch and broadcast together:
-
-        out[..., k] = sum_{i + j = k} a[..., i] * b[..., j].
-
-    Degrees are tiny (each per-position factor is degree <= 1), so the loop over
-    ``b``'s degree axis is cheap; clarity beats cleverness here.
-
-    Args:
-        a: ``(..., da)`` coefficient tensor.
-        b: ``(..., db)`` coefficient tensor.
-
-    Returns:
-        ``(..., da + db - 1)`` coefficient tensor of the product.
-    """
-    la, lb = a.shape[-1], b.shape[-1]
-    batch = torch.broadcast_shapes(a.shape[:-1], b.shape[:-1])
-    out = a.new_zeros(*batch, la + lb - 1)
-    for j in range(lb):
-        out[..., j:j + la] = out[..., j:j + la] + a * b[..., j:j + 1]
-    return out
-
-
-def poly_prod_over_positions(factors: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Univariate polynomial product across all ``L`` positions (the DP step).
-
-    The direct analog of ``torch.prod(out, dim=<position>)`` in the ordinary
-    ``compute_z`` -- but each per-position "value" is a coefficient vector in ``w``,
-    so the reduction is a convolution rather than a scalar product.
-
-    Args:
-        factors: length-``L`` sequence; ``factors[p]`` has shape ``(..., deg_p + 1)``
-            and holds the coefficients of the position-``p`` factor. For the SHAP
-            mean, the target position contributes degree 0 (length 1) and every other
-            position degree 1 (length 2), so the result has degree <= ``L-1``.
-
-    Returns:
-        ``(..., total_deg + 1)`` coefficient tensor of the full product.
-    """
-    acc = factors[0]
-    for f in factors[1:]:
-        acc = _poly_mul_1d(acc, f)
-    return acc
-
-
-def apply_R(coeffs: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-    """Apply the linear functional ``R``: contract coefficients with ``g``.
-
-    ``R`` replaces ``w^s`` by ``g(s)`` and sums, i.e. a dot product of the
-    coefficient vector with ``g`` (truncated to the coefficient length).
-
-    Args:
-        coeffs: ``(..., D)`` coefficient tensor, ``D <= len(g)``.
-        g: ``(L,)`` SHAP weight vector from :func:`g_weights`.
-
-    Returns:
-        ``(...,)`` tensor -- the scalar value of ``R`` applied along the last axis.
-    """
-    D = coeffs.shape[-1]
-    return torch.einsum("...d,d->...", coeffs, g[:D].to(coeffs.dtype))
-
-
-def _poly_mul_2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Convolve two *bivariate* coefficient tensors along the last two axes.
-
-    Used by the covariance path, where each position carries a factor in two
-    bookkeeping variables (``w`` for SHAP index ``i``, ``w'`` for index ``j``).
-    Coefficient layout is ``[..., power_of_w, power_of_w']``:
-
-        out[..., k, l] = sum_{i1+j1=k, i2+j2=l} a[..., i1, i2] * b[..., j1, j2].
-
-    Per-position degrees are <= 1 in each variable, so the double loop is cheap.
-
-    Args:
-        a: ``(..., da_w, da_wp)``.
-        b: ``(..., db_w, db_wp)``.
-
-    Returns:
-        ``(..., da_w + db_w - 1, da_wp + db_wp - 1)``.
-    """
-    daw, dawp = a.shape[-2], a.shape[-1]
-    dbw, dbwp = b.shape[-2], b.shape[-1]
-    batch = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
-    out = a.new_zeros(*batch, daw + dbw - 1, dawp + dbwp - 1)
-    for j1 in range(dbw):
-        for j2 in range(dbwp):
-            out[..., j1:j1 + daw, j2:j2 + dawp] = (
-                out[..., j1:j1 + daw, j2:j2 + dawp] + a * b[..., j1:j1 + 1, j2:j2 + 1]
-            )
-    return out
-
-
-def poly_prod_over_positions_bivariate(factors: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Bivariate polynomial product across positions (the covariance DP step)."""
-    acc = factors[0]
-    for f in factors[1:]:
-        acc = _poly_mul_2d(acc, f)
-    return acc
-
-
-def apply_RxR(coeffs2: torch.Tensor, g: torch.Tensor, g2: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Apply ``R x R``: contract a bivariate coefficient tensor with ``g_a (x) g_b``.
-
-        (R x R)( sum_{a,b} c_{a,b} w^a w'^b ) = sum_{a,b} c_{a,b} g_a(a) g_b(b).
-
-    The two axes may carry different weight vectors -- needed when the two sides are
-    interactions of different orders (the ``w`` axis uses ``g_{k}`` for the row tuple,
-    the ``w'`` axis uses ``g_{k'}`` for the column tuple). For the common same-order
-    case, pass a single ``g`` and it is used on both axes.
-
-    Args:
-        coeffs2: ``(..., Da, Db)`` bivariate coefficients.
-        g: weight vector for the ``w`` (row / first) axis.
-        g2: weight vector for the ``w'`` (column / second) axis; defaults to ``g``.
-
-    Returns:
-        ``(...,)`` tensor.
-    """
-    if g2 is None:
-        g2 = g
-    Da, Db = coeffs2.shape[-2], coeffs2.shape[-1]
-    return torch.einsum("...ab,a,b->...", coeffs2, g[:Da].to(coeffs2.dtype), g2[:Db].to(coeffs2.dtype))
+# The polynomial layer of the generalized kernel trick (model-independent primitives).
+from generalized_kernel_trick import (
+    g_weights,
+    poly_prod_over_positions,
+    poly_prod_over_positions_bivariate,
+    apply_R,
+    apply_RxR,
+)
 
 
 # =============================================================================
-# SECTION B -- The SHAP computer
+# The SHAP computer
 # =============================================================================
 
 
@@ -305,10 +181,10 @@ class ShapKernelTrickComputer:
 
     A composition wrapper around a ``KernelTrickComputer`` (``self.ktc``): all kernel,
     training-data, and posterior quantities are read from ``self.ktc``, and this class
-    adds only the polynomial layer (Section A) plus the SHAP-specific factor builders
-    and assembly. Composing rather than subclassing keeps the tested kernel-trick
-    implementation untouched and makes the reuse boundary explicit (every reused
-    quantity is an attribute access on ``self.ktc``).
+    adds only the polynomial layer (imported from ``generalized_kernel_trick``) plus the
+    SHAP-specific factor builders and assembly. Composing rather than subclassing keeps
+    the tested kernel-trick implementation untouched and makes the reuse boundary explicit
+    (every reused quantity is an attribute access on ``self.ktc``).
 
     Typical use (mirrors how the kernel trick is used on g2p data)::
 
@@ -824,29 +700,40 @@ class ShapKernelTrickComputer:
         pi: torch.Tensor,
         eta: float,
         interactions: Sequence[Tuple[int, ...]],
+        weight_fn: Optional[Callable[[int], torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Build ``mK = m^T K_{*,X}`` for each interaction tuple ``T`` (raw SII weights).
+        """Build ``mK = m^T K_{*,X}`` for each interaction tuple ``T`` (raw index weights).
 
         Generalizes :meth:`_shap_z_mean` from a single index ``i`` to a set ``T``: every
         position ``p in T`` takes the degree-0 difference factor ``[c1[p] - c0[p]]`` and
         every other position the shared degree-1 factor ``[c0[p], c1[p]]``. Their
         polynomial product over ``p`` is a ``(t, L - |T| + 1)`` coefficient tensor, which
-        ``apply_R`` contracts with the order-``|T|`` weight ``g_{|T|}``.
+        ``apply_R`` contracts with the order-``|T|`` weight vector.
 
         This is the position-factorized discrete derivative ``Delta_T f_x(S)`` summed
         against ``g_{|T|}(|S|)`` over all ``S`` disjoint from ``T`` -- exactly the
         interaction analog of the first-order row.
 
+        Args:
+            weight_fn: callable mapping the interaction order ``k = |T|`` to the R-weight
+                vector (length ``L - k + 1``). This is the *only* thing that distinguishes
+                one interaction index from another -- the moment itself is identical. If
+                None (default), the Shapley Interaction Index weight ``self._g_for_order``
+                is used, so existing SII callers are unchanged. See :meth:`_index_weight_fn`
+                for the named choices (``'sii'`` vs ``'dividend'``).
+
         Returns:
-            ``mK`` of shape ``(len(interactions), t)``; these are the *unnormalized* SII
-            rows (the public method rescales them per the chosen normalization).
+            ``mK`` of shape ``(len(interactions), t)``; these are the *unnormalized* rows
+            for the chosen index (the public method rescales them per its normalization).
         """
         L = self.seq_length
+        if weight_fn is None:
+            weight_fn = self._g_for_order
         c0, c1 = self._mean_channels(x_onehot, pi, eta)          # (L, t), (L, t)
         rows = []
         for T in interactions:
             Tset = set(T)
-            g_k = self._g_for_order(len(Tset)).to(c0.dtype)
+            g_k = weight_fn(len(Tset)).to(c0.dtype)
             factors = []
             for p in range(L):
                 if p in Tset:
@@ -863,8 +750,9 @@ class ShapKernelTrickComputer:
         pi: torch.Tensor,
         eta: float,
         interactions: Sequence[Tuple[int, ...]],
+        weight_fn: Optional[Callable[[int], torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Build ``R[a, b] = m^{T_a} K m^{T_b}`` via the bivariate GKT (raw SII weights).
+        """Build ``R[a, b] = m^{T_a} K m^{T_b}`` via the bivariate GKT (raw index weights).
 
         Generalizes :meth:`_shap_R_cov`: the per-position bivariate factor branches on
         ``p in T_a`` (the ``w`` axis) and ``p in T_b`` (the ``w'`` axis) instead of
@@ -878,13 +766,20 @@ class ShapKernelTrickComputer:
             p in neither      (deg (1,1)):  [[ aa, fa ], [ fa, ff ]]
 
         The product over positions is contracted with ``apply_RxR`` using the two tuples'
-        weight vectors ``g_{|T_a|}`` (rows) and ``g_{|T_b|}`` (columns) -- they differ
-        when the tuples have different sizes.
+        weight vectors (rows for ``T_a``, columns for ``T_b``) -- they differ when the
+        tuples have different sizes.
+
+        Args:
+            weight_fn: callable mapping order ``k`` to the R-weight vector; None (default)
+                selects the SII weight ``self._g_for_order`` so SII callers are unchanged.
+                See :meth:`_index_weight_fn`.
 
         Returns:
-            ``R`` of shape ``(len(interactions), len(interactions))`` (unnormalized SII).
+            ``R`` of shape ``(len(interactions), len(interactions))`` (unnormalized).
         """
         L = self.seq_length
+        if weight_fn is None:
+            weight_fn = self._g_for_order
         sc = self._cov_scalars(x_onehot, pi, eta)
         K_ff, K_fa, K_aa = sc["K_ff"], sc["K_fa"], sc["K_aa"]     # each (L,)
 
@@ -894,7 +789,7 @@ class ShapKernelTrickComputer:
         def gord(k: int) -> torch.Tensor:
             g = g_by_order.get(k)
             if g is None:
-                g = self._g_for_order(k).to(K_ff.dtype)
+                g = weight_fn(k).to(K_ff.dtype)
                 g_by_order[k] = g
             return g
 
@@ -1115,6 +1010,333 @@ class ShapKernelTrickComputer:
         return Phi
 
     # ------------------------------------------------------------------ #
+    # Interaction index selection (weight vector for the R-functional)
+    # ------------------------------------------------------------------ #
+
+    def _index_weight_fn(self, index: str) -> Callable[[int], torch.Tensor]:
+        """Return a callable ``k -> g_k`` giving the R-weight vector for a named index.
+
+        Every interaction quantity in this module is the SAME position-factorized GKT
+        moment (built by :meth:`_shap_z_interaction` / :meth:`_shap_R_interaction`)
+        collapsed by a different weight vector ``g_k(s)`` -- the value the linear
+        functional ``R`` contracts the size-``s`` (== ``|S|``) coefficient against.
+        Choosing an interaction index is therefore *only* choosing this weight:
+
+        * ``'sii'``      -- Shapley Interaction Index (Grabisch-Roubens),
+          ``g_k(s) = s! (L - k - s)! / (L - k + 1)!`` (see :func:`g_weights`). Averages
+          the discrete derivative ``Delta_T f_x(S)`` over *all* contexts ``S``, which
+          smears a genuine high-order effect down onto its lower-order subsets.
+        * ``'dividend'`` -- Harsanyi dividend == full-order (``ell == L``) Faith-Shap,
+          ``g_k = [1, 0, 0, ...]`` (keep only ``S = empty``). The *pure*, non-smearing
+          interaction ``a(T) = Delta_T f_x(empty)``.
+
+        Args:
+            index: ``'sii'`` or ``'dividend'``.
+
+        Returns:
+            A function mapping the interaction order ``k`` to a length-``(L - k + 1)``
+            weight vector (``self._g_dtype`` on ``self.device``).
+        """
+        if index == "sii":
+            return lambda k: self._g_for_order(k)
+        if index == "dividend":
+            def _delta_weight(k: int) -> torch.Tensor:
+                v = torch.zeros(self.seq_length - k + 1,
+                                device=self.device, dtype=self._g_dtype)
+                v[0] = 1.0
+                return v
+            return _delta_weight
+        raise ValueError(f"unknown interaction index '{index}' (use 'sii' or 'dividend').")
+
+    # ------------------------------------------------------------------ #
+    # Public: Harsanyi dividends (full-order Faith-Shap) -- the pure interaction
+    # ------------------------------------------------------------------ #
+
+    def dividend_values(
+        self,
+        x: Union[str, torch.Tensor],
+        pi: torch.Tensor,
+        interactions: Optional[Sequence[Sequence[int]]] = None,
+        order: Optional[int] = 2,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        calc_covar: bool = False,
+        use_double: bool = True,
+    ):
+        """Harsanyi dividends ``a(T) = Delta_T f_x(empty)`` -- the *pure* interaction.
+
+        For a position set ``T = {i_1, ..., i_k}`` this returns
+
+            a(T) = sum_{W subseteq T} (-1)^{|T| - |W|} f_x(W),
+
+        the discrete ``k``-th derivative of the conditional expectation evaluated at the
+        empty context (no averaging over other-position subsets ``S``). This is exactly
+        *full-order* (``ell == L``) Faith-Shap: unlike SII, a genuine order-``m`` effect
+        contributes to its own order-``m`` set and to *nothing smaller* -- there is no
+        smearing onto subsets. It is the object to use for "which position-sets are
+        *irreducibly* epistatic?".
+
+        Relation to the SII path
+        -------------------------
+        Same machinery as :meth:`shap_interaction_values`, with two differences:
+        (1) the R-weight is ``[1, 0, 0, ...]`` (keep only ``S = empty``) instead of the
+        SII weight (:meth:`_index_weight_fn`); (2) there is no ``k!`` symmetrization --
+        dividends are the raw multilinear coefficients. Concretely the mean row collapses
+        to a plain product,
+
+            a(T) = sum_t Qy_t * prod_{p in T} (c1[p,t] - c0[p,t]) * prod_{p not in T} c0[p,t],
+
+        with ``c0`` / ``c1`` the pi- and fixed-channels of :meth:`_mean_channels`.
+
+        Interpretation caveats
+        ----------------------
+        * Under a *product* background ``pi`` at ``eta == 1``, ``a(T)`` as a function of the
+          target ``x`` is the functional-ANOVA component ``f_T(x_T)`` -- which is what makes
+          the global variance a Sobol index (see :meth:`global_dividend_summary`).
+        * Dividends are NOT efficient: there is no per-order sum equal to ``f(x) - phi_0``.
+          Use them for ranking / structure discovery, not for an additive "the parts add
+          up" explanation.
+        * The order-1 dividend ``a({i}) = f_x(i) - f_x(empty)`` is the ANOVA *main effect*
+          and differs from the first-order Shapley value :meth:`shap_values` -- do not mix
+          them. (This is the "even the singletons change" point of full-order Faith-Shap.)
+
+        Args:
+            x, pi, interactions, order, eta, indices, calc_covar, use_double: as in
+                :meth:`shap_interaction_values`. ``order`` enumerates all size-``order``
+                subsets when ``interactions`` is None (default 2 == pairwise).
+
+        Returns:
+            ``(interactions, a)`` if ``calc_covar`` is False, else
+            ``(interactions, a, cov)``; shapes match :meth:`shap_interaction_values`.
+
+        Verify with ``shap_brute_force.ShapBruteForce.bf_dividend_values`` /
+        ``bf_dividend_covariance`` (independent subset enumeration; the ``S = empty`` case
+        of the SII brute force).
+        """
+        if use_double:
+            self.ktc.set_precision(use_double=True)
+        comp = self.ktc.comp_dtype
+
+        x_oh = self.target_to_onehot(x).to(comp)
+        pi = pi.to(device=self.device, dtype=comp)
+        self.ktc.validate_pis(pi)
+
+        T_list = self._resolve_interactions(interactions, order, indices)
+        wfn = self._index_weight_fn("dividend")
+
+        # Dividend rows m^T K_{*,X} (no k! normalization -- these are the raw coefficients).
+        mK = self._shap_z_interaction(x_oh, pi, eta, T_list, weight_fn=wfn)   # (n, t)
+        Qy = self.ktc.Qy.to(comp)                                            # (t,)
+        a = mK @ Qy                                                          # (n,)
+
+        if not calc_covar:
+            return T_list, a
+
+        R = self._shap_R_interaction(x_oh, pi, eta, T_list, weight_fn=wfn)   # (n, n)
+        S = self.ktc.S.to(comp)                                             # (t, t)
+        zS = mK @ S                                                         # (n, t)
+        cov = R - zS @ zS.T                                                # (n, n)
+        return T_list, a, cov
+
+    def dividend_values_batch(
+        self,
+        xs: Sequence[Union[str, torch.Tensor]],
+        pi: torch.Tensor,
+        interactions: Optional[Sequence[Sequence[int]]] = None,
+        order: Optional[int] = 2,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        use_double: bool = True,
+    ) -> Tuple[List[Tuple[int, ...]], torch.Tensor]:
+        """Dividends ``a(T)(x)`` for many targets against one background ``pi``.
+
+        Loops :meth:`dividend_values` over ``xs`` (the "many x, one pi" axis used by the
+        global summaries). Mirrors :meth:`shap_values_batch`.
+
+        Returns:
+            ``(interactions, A)`` with ``A`` of shape ``(len(xs), len(interactions))`` and
+            ``interactions`` the resolved tuple list (row order of every column of ``A``).
+        """
+        T_list: Optional[List[Tuple[int, ...]]] = None
+        rows = []
+        for x in xs:
+            T_list, a = self.dividend_values(
+                x, pi, interactions=interactions, order=order, eta=eta,
+                indices=indices, calc_covar=False, use_double=use_double,
+            )
+            rows.append(a)
+        return T_list, torch.stack(rows, dim=0)
+
+    # ------------------------------------------------------------------ #
+    # Public: global (dataset-level) summaries
+    # ------------------------------------------------------------------ #
+
+    def global_shap_importance(
+        self,
+        xs: Sequence[Union[str, torch.Tensor]],
+        pi: torch.Tensor,
+        indices: Optional[Sequence[int]] = None,
+        eta: float = 1.0,
+        use_double: bool = True,
+    ) -> Tuple[List[int], torch.Tensor]:
+        """Global first-order importance: mean ``|phi_i|`` over a target sample.
+
+        The canonical SHAP global summary. Averaging the *absolute* value (not the signed
+        value) is deliberate: a position can matter globally yet have signed ``phi_i`` that
+        averages to ~0 because it pushes the phenotype up on some targets and down on
+        others -- the sign cancellation would hide real importance.
+
+        This is importance *under the target distribution you pass* (typically the training
+        set, or a sample of it), and it is still relative to the background ``pi``; it is
+        not "irrespective of target sequence" in any absolute sense. A biased ``xs`` biases
+        the summary the same way.
+
+        Args:
+            xs: target sequences to average over (strings or one-hot tensors).
+            pi: background distribution ``(L, A)``.
+            indices: positions to score (default all ``L``).
+            eta: background-channel scale.
+            use_double: run in float64.
+
+        Returns:
+            ``(indices, mean_abs)`` with ``mean_abs`` of shape ``(len(indices),)``.
+        """
+        phis = self.shap_values_batch(xs, pi, eta=eta, indices=indices,
+                                      use_double=use_double)          # (n_x, m)
+        idx = list(range(self.seq_length)) if indices is None else [int(i) for i in indices]
+        return idx, phis.abs().mean(dim=0)
+
+    def global_dividend_summary(
+        self,
+        xs: Sequence[Union[str, torch.Tensor]],
+        pi: torch.Tensor,
+        interactions: Optional[Sequence[Sequence[int]]] = None,
+        order: Optional[int] = 2,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        use_double: bool = True,
+        normalize_sobol: bool = False,
+    ) -> Tuple[List[Tuple[int, ...]], Dict[str, torch.Tensor]]:
+        """Global interaction summary from dividends ``a(T)`` over a target sample.
+
+        Computes ``a(T)(x)`` for every target ``x`` in ``xs`` (via
+        :meth:`dividend_values_batch`) and reduces over the target axis into three
+        dataset-level quantities per tuple ``T``:
+
+        * ``mean_abs``    -- ``mean_x |a(T)(x)|``: global importance of the interaction
+          ``T`` (analog of mean ``|phi_i|`` for single positions).
+        * ``mean_signed`` -- ``mean_x a(T)(x)``: a diagnostic. Under a product background
+          ``pi`` with targets drawn from ``pi``, ANOVA components of order ``>= 1`` are
+          mean-zero, so this should be ~0 for non-empty ``T`` -- a useful sanity check that
+          also flags when ``xs`` is far from ``pi``.
+        * ``sobol_unnorm`` -- ``Var_x a(T)(x)``: the (unnormalized) Sobol sensitivity index
+          for ``T``. This equality -- variance of the dividend == Sobol index -- holds
+          because ``a(T)(x)`` is the functional-ANOVA component ``f_T`` (product ``pi``,
+          ``eta == 1``), and ANOVA components are orthogonal, so the total variance splits
+          cleanly across tuples. It is the global, non-smearing analog of the local
+          dividend.
+
+        Precondition for the Sobol reading
+        -----------------------------------
+        The variance is a Sobol index *only when the targets ``xs`` are sampled from the
+        same product distribution ``pi`` used as the background*. If you instead pass the
+        training set (generally NOT distributed as ``pi``), ``sobol_unnorm`` is the variance
+        of the ANOVA component over the empirical target distribution -- still a reasonable
+        global importance, but not the formal Sobol index. The reduction is reported either
+        way; interpret it according to how ``xs`` was drawn.
+
+        Args:
+            xs, pi, interactions, order, eta, indices, use_double: as in
+                :meth:`dividend_values_batch`.
+            normalize_sobol: if True, also return ``sobol_normalized`` = ``sobol_unnorm``
+                divided by the *sample* variance of ``f(x)`` over ``xs`` (reported as
+                ``total_var_sample``). This normalized value is a sample estimate; it is a
+                genuine Sobol *ratio* only under the same "``xs`` ~ ``pi``" precondition.
+
+        Returns:
+            ``(interactions, summary)`` where ``summary`` is a dict of ``(n,)`` tensors
+            keyed by the names above (plus ``total_var_sample`` / ``sobol_normalized`` when
+            ``normalize_sobol`` is True), and ``interactions`` is the resolved tuple list.
+        """
+        T_list, A = self.dividend_values_batch(
+            xs, pi, interactions=interactions, order=order, eta=eta,
+            indices=indices, use_double=use_double,
+        )                                                            # (n_x, n)
+        summary: Dict[str, torch.Tensor] = {
+            "mean_abs": A.abs().mean(dim=0),
+            "mean_signed": A.mean(dim=0),
+            "sobol_unnorm": A.var(dim=0, unbiased=False),
+        }
+        if normalize_sobol:
+            comp = self.ktc.comp_dtype
+            # f(x) is E_MAP at the delta distribution on x (fixing every position).
+            fvals = torch.stack([self.ktc.E_MAP(self.target_to_onehot(x).to(comp))
+                                 for x in xs])                       # (n_x,)
+            total_var = fvals.var(unbiased=False)
+            summary["total_var_sample"] = total_var
+            summary["sobol_normalized"] = summary["sobol_unnorm"] / total_var
+        return T_list, summary
+
+    # ------------------------------------------------------------------ #
+    # Public: truncated Faith-Shap (SPECIFIED, NOT YET IMPLEMENTED)
+    # ------------------------------------------------------------------ #
+
+    def faith_shap_values(
+        self,
+        x: Union[str, torch.Tensor],
+        pi: torch.Tensor,
+        order_max: int,
+        interactions: Optional[Sequence[Sequence[int]]] = None,
+        order: Optional[int] = 2,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        calc_covar: bool = False,
+        use_double: bool = True,
+    ):
+        """Truncated Faith-Shap interaction index at max order ``order_max`` -- NOT YET IMPLEMENTED.
+
+        Faith-Shap (Tsai, Yeh & Ravikumar, JMLR 2023) is the interaction index whose
+        order-``<= ell`` values are the coefficients of the *best* degree-``ell`` multilinear
+        surrogate of the game ``v(S) = f_x(S)`` under the Shapley kernel, subject to
+        efficiency. Two anchors fix its behavior:
+
+        * ``ell == 1``  -> the first-order Shapley values (:meth:`shap_values`);
+        * ``ell == L``  -> the Harsanyi dividends (:meth:`dividend_values`).
+
+        For ``1 < ell < L`` the value of a set ``T`` (``|T| <= ell``) is the dividend ``a(T)``
+        plus a size-weighted sum of the *higher* dividends ``a(W)`` over ``W`` strictly
+        containing ``T`` with ``|W| > ell``. Consequently it is *exact* (equals the
+        dividends, no smearing) precisely when the model's true maximum interaction order is
+        ``<= ell``; when the true order exceeds ``ell`` it redistributes that higher-order
+        epistasis into the ``<= ell`` terms (a projection-induced smearing distinct from
+        SII's context-averaging).
+
+        Why this is a stub (not a silent guess)
+        ---------------------------------------
+        The redistribution is a fixed linear combination of dividends, and each dividend is
+        a product-form moment this module already computes, so the poly-time GKT route is:
+        contract the same interaction moment against a modified weight vector encoding those
+        coefficients (i.e. another entry in :meth:`_index_weight_fn`). The blocker is purely
+        that the *exact* coefficients must be transcribed from Tsai et al. and unit-tested
+        against the two anchors above (``ell == 1`` reproducing :meth:`shap_values`,
+        ``ell == L`` reproducing :meth:`dividend_values`) plus a small-``L`` weighted
+        least-squares brute force -- rather than hard-coded from memory. Until that check is
+        in place this raises, so no unverified index silently enters an analysis.
+
+        Raises:
+            NotImplementedError: always, with guidance to use :meth:`dividend_values`
+                (the ``ell == L`` case, no smearing) or :meth:`shap_interaction_values`
+                (SII) in the meantime.
+        """
+        raise NotImplementedError(
+            "Truncated Faith-Shap (order_max < L) is specified but not implemented: the "
+            "exact redistribution weights must be transcribed and unit-tested against "
+            "Tsai, Yeh & Ravikumar (2023) (and the ell==1 -> Shapley, ell==L -> dividend "
+            "limits) before use. Use dividend_values for the ell==L case (no smearing) or "
+            "shap_interaction_values for SII in the meantime."
+        )
+
+    # ------------------------------------------------------------------ #
     # Public: extensions (specified, not yet implemented)
     # ------------------------------------------------------------------ #
 
@@ -1134,9 +1356,4 @@ class ShapKernelTrickComputer:
 
 __all__ = [
     "ShapKernelTrickComputer",
-    "g_weights",
-    "poly_prod_over_positions",
-    "poly_prod_over_positions_bivariate",
-    "apply_R",
-    "apply_RxR",
 ]
