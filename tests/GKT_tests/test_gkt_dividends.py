@@ -504,6 +504,131 @@ def make_dividend_benchmark_plot(bench, out_dir):
 # Scenario ladder
 # =========================================================================== #
 
+def _bf_faith_shap(shap, bf, x_oh, pi, S_list, ell, L):
+    """Independent brute-force Faith-Shap via the paper's Eq. (16) on brute-force dividends.
+
+    This does NOT reuse the module's linear-map assembly: it recomputes every needed dividend
+    with ``ShapBruteForce.bf_dividend_values`` (subset enumeration) and applies the Eq. (16)
+    coefficient in plain Python. Agreement with ``shap.faith_shap_values`` therefore checks the
+    module's assembly, not just its arithmetic against itself.
+    """
+    from math import comb as _comb
+
+    def coeff(s, t):
+        return ((-1.0) ** (ell - s)) * (s / (ell + s)) * _comb(ell, s) \
+            * _comb(t - 1, ell) / _comb(t + ell - 1, ell + s)
+
+    universe = list(range(L))
+    # gather all needed tuples: reported S plus supersets T with ell < |T| <= L
+    needed = set(tuple(sorted(S)) for S in S_list)
+    for S in S_list:
+        rest = [p for p in universe if p not in set(S)]
+        for k in range(1, len(rest) + 1):
+            for extra in itertools.combinations(rest, k):
+                T = tuple(sorted(set(S) | set(extra)))
+                if ell < len(T) <= L:
+                    needed.add(T)
+    by_order = {}
+    for T in needed:
+        by_order.setdefault(len(T), []).append(T)
+    a = {}
+    for k, Ts in by_order.items():
+        vals = bf.bf_dividend_values(x_oh, pi, Ts)
+        for T, v in zip(Ts, vals.detach().cpu().numpy().tolist()):
+            a[tuple(sorted(T))] = v
+
+    out = []
+    for S in S_list:
+        Sset = set(S); s = len(S)
+        val = a[tuple(sorted(S))]
+        rest = [p for p in universe if p not in Sset]
+        for k in range(1, len(rest) + 1):
+            for extra in itertools.combinations(rest, k):
+                T = tuple(sorted(Sset | set(extra)))
+                if ell < len(T) <= L:
+                    val += coeff(s, len(T)) * a[T]
+        out.append(val)
+    return np.array(out)
+
+
+def run_faith_shap_checks(L=5, alphabet="ACGT", seed=0, device="cpu",
+                          kernel="jenga", n_iter=150, atol=1e-6):
+    """Validate truncated Faith-Shap against its anchors and an independent brute force.
+
+    Checks, on a fitted GP with a real (interacting) landscape:
+      (1) anchor ell == 1  : faith_shap_values == shap_values (first-order Shapley).
+      (2) anchor ell == L  : faith_shap_values == dividend_values (Harsanyi dividends).
+      (3) truncated 1<ell<L: faith_shap_values == independent Eq.(16) brute force on BF dividends.
+      (4) covariance: M @ cov_a @ M.T is symmetric and, at ell==L, equals the dividend cov.
+    """
+    A = len(set(alphabet))
+    dev = torch.device(device)
+    print(f"\n{'='*78}\nFAITH-SHAP CHECKS  (anchors + brute force)   L={L} A={A} device={device}")
+    print("=" * 78)
+
+    # a landscape with structure at several orders so truncation is a real test
+    pairs, triples = [(1, 3)], [(0, 2, 4)] if L >= 5 else []
+    ktc, info = build_interacting_ktc(L, alphabet, pairs=pairs, triples=triples,
+                                      quads=[], add_mag=1.0, inter_mag=5.0,
+                                      seed=seed, kernel=kernel, n_iter=n_iter)
+    if device != "cpu":
+        move_ktc_to_device(ktc, device)
+    ktc.set_precision(use_double=True)
+    shap = ShapKernelTrickComputer(ktc=ktc)
+    bf = ShapBruteForce(shap)
+
+    pi = torch.full((L, A), 1.0 / A, dtype=DT, device=dev)
+    x = make_targets(L, A, 1, seed)[0].clone()
+    x_oh = onehot(x, A, device=dev)
+
+    report = []
+    def check(nm, ok, detail=""):
+        report.append((nm, bool(ok), detail)); return ok
+    all_pass = True
+
+    singles = all_tuples(L, 1)
+
+    # (1) ell == 1 -> first-order Shapley
+    _, fs1 = shap.faith_shap_values(x_oh, pi, order_max=1, interactions=singles)
+    phi1 = shap.shap_values(x_oh, pi, indices=list(range(L)))
+    e1 = float((fs1.detach().cpu() - phi1.detach().cpu()).abs().max())
+    all_pass &= check("[faith] ell==1 == first-order Shapley", e1 < atol, f"max abs err={e1:.2e}")
+
+    # (2) ell == L -> Harsanyi dividends (order-1 and order-2 tuples)
+    S2 = all_tuples(L, 1) + all_tuples(L, 2)
+    _, fsL = shap.faith_shap_values(x_oh, pi, order_max=L, interactions=S2)
+    _, aL = shap.dividend_values(x_oh, pi, interactions=S2)
+    eL = float((fsL.detach().cpu() - aL.detach().cpu()).abs().max())
+    all_pass &= check("[faith] ell==L == Harsanyi dividends", eL < atol, f"max abs err={eL:.2e}")
+
+    # (3) truncated 1<ell<L vs independent Eq.(16) brute force
+    if L >= 4:
+        ell = 2
+        S_report = all_tuples(L, 1) + all_tuples(L, 2)
+        _, fsT = shap.faith_shap_values(x_oh, pi, order_max=ell, interactions=S_report)
+        bfT = _bf_faith_shap(shap, bf, x_oh, pi, S_report, ell, L)
+        eT = float(np.abs(fsT.detach().cpu().numpy() - bfT).max())
+        all_pass &= check(f"[faith] ell={ell} == brute-force Eq.(16)", eT < 1e-5,
+                          f"max abs err={eT:.2e} over {len(S_report)} tuples")
+
+    # (4) covariance: symmetry always; equals dividend cov at ell==L
+    cov_tuples = all_tuples(L, 1) + all_tuples(L, 2)[:3]
+    _, _, covF = shap.faith_shap_values(x_oh, pi, order_max=L, interactions=cov_tuples,
+                                        calc_covar=True)
+    _, _, covA = shap.dividend_values(x_oh, pi, interactions=cov_tuples, calc_covar=True)
+    sym = float((covF - covF.transpose(-1, -2)).abs().max())
+    all_pass &= check("[faith] covariance symmetric", sym < atol, f"asym={sym:.2e}")
+    ec = float((covF.detach().cpu() - covA.detach().cpu()).abs().max())
+    all_pass &= check("[faith] ell==L covariance == dividend covariance", ec < 1e-5,
+                      f"max abs err={ec:.2e}")
+
+    for nm, ok, detail in report:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {nm}" + (f"  ({detail})" if detail else ""))
+    print("-" * 78)
+    print("  " + ("ALL FAITH-SHAP CHECKS PASS" if all_pass else "SOME FAITH-SHAP CHECKS FAILED"))
+    return all_pass
+
+
 def run_all_scenarios(alphabet="ACGT", L=5, seed=0, device="cpu",
                       inject_pair=(1, 3), inject_triple=(0, 2, 4),
                       inter_mag=5.0, add_mag=1.0, kernel="jenga", n_iter=150,
@@ -536,6 +661,11 @@ def run_all_scenarios(alphabet="ACGT", L=5, seed=0, device="cpu",
         all_pass = all_pass and ok
     else:
         print("\n[note] skipping scenario E (needs L>=5 for a 4th-order interaction).")
+
+    # Faith-Shap: anchors (ell==1 -> Shapley, ell==L -> dividends) + brute-force Eq.(16).
+    fs_ok = run_faith_shap_checks(L=L, alphabet=alphabet, seed=seed, device=device,
+                                  kernel=kernel, n_iter=n_iter)
+    all_pass = all_pass and fs_ok
 
     return all_pass
 

@@ -156,7 +156,7 @@ different weight vector (see ``_index_weight_fn``); pick by the question you are
 from __future__ import annotations
 
 import itertools
-from math import factorial
+from math import comb, factorial
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -1278,8 +1278,31 @@ class ShapKernelTrickComputer:
         return T_list, summary
 
     # ------------------------------------------------------------------ #
-    # Public: truncated Faith-Shap (SPECIFIED, NOT YET IMPLEMENTED)
+    # Public: truncated Faith-Shap (Tsai, Yeh & Ravikumar 2023, Thm 19 / Eq. 16)
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _faith_shap_coeff(s: int, t: int, ell: int) -> float:
+        """Eq. (16) redistribution coefficient of dividend ``a(T)`` into Faith-Shap of ``S``.
+
+        For ``S subset T`` with ``|S| = s <= ell`` and ``|T| = t``, Faith-Shap is
+
+            E^{F-Shap}_S(v, ell) = a(S)
+              + [s == 0 excluded] sum_{T superset S, |T| = t > ell} coeff(s, t, ell) * a(T),
+
+        where, from Tsai-Yeh-Ravikumar (2023) Theorem 19,
+
+            coeff(s, t, ell) = (-1)^{ell - s} * (s / (ell + s)) * C(ell, s)
+                               * C(t - 1, ell) / C(t + ell - 1, ell + s).
+
+        This is only invoked for the *tail* (``t > ell``); for ``t <= ell`` the contribution
+        of ``a(T)`` to ``E_S`` is ``1`` if ``T == S`` and ``0`` otherwise (i.e. the identity
+        ``a(S)`` term), which the caller handles directly. Verified against the paper's
+        Table 2 worked example and against both anchors (``ell == 1`` -> Shapley,
+        ``ell == L`` -> dividends).
+        """
+        return ((-1.0) ** (ell - s)) * (s / (ell + s)) * comb(ell, s) \
+            * comb(t - 1, ell) / comb(t + ell - 1, ell + s)
 
     def faith_shap_values(
         self,
@@ -1292,10 +1315,11 @@ class ShapKernelTrickComputer:
         indices: Optional[Sequence[int]] = None,
         calc_covar: bool = False,
         use_double: bool = True,
+        order_cap: Optional[int] = None,
     ):
-        """Truncated Faith-Shap interaction index at max order ``order_max`` -- NOT YET IMPLEMENTED.
+        """Truncated Faith-Shap interaction index at maximum order ``order_max`` (== ``ell``).
 
-        Faith-Shap (Tsai, Yeh & Ravikumar, JMLR 2023) is the interaction index whose
+        Faith-Shap (Tsai, Yeh & Ravikumar, JMLR 2023) is the unique interaction index whose
         order-``<= ell`` values are the coefficients of the *best* degree-``ell`` multilinear
         surrogate of the game ``v(S) = f_x(S)`` under the Shapley kernel, subject to
         efficiency. Two anchors fix its behavior:
@@ -1303,38 +1327,192 @@ class ShapKernelTrickComputer:
         * ``ell == 1``  -> the first-order Shapley values (:meth:`shap_values`);
         * ``ell == L``  -> the Harsanyi dividends (:meth:`dividend_values`).
 
-        For ``1 < ell < L`` the value of a set ``T`` (``|T| <= ell``) is the dividend ``a(T)``
-        plus a size-weighted sum of the *higher* dividends ``a(W)`` over ``W`` strictly
-        containing ``T`` with ``|W| > ell``. Consequently it is *exact* (equals the
-        dividends, no smearing) precisely when the model's true maximum interaction order is
-        ``<= ell``; when the true order exceeds ``ell`` it redistributes that higher-order
-        epistasis into the ``<= ell`` terms (a projection-induced smearing distinct from
-        SII's context-averaging).
+        Closed form (Theorem 19, Eq. 16)
+        --------------------------------
+        For a set ``S`` with ``|S| = s <= ell``,
 
-        Why this is a stub (not a silent guess)
-        ---------------------------------------
-        The redistribution is a fixed linear combination of dividends, and each dividend is
-        a product-form moment this module already computes, so the poly-time GKT route is:
-        contract the same interaction moment against a modified weight vector encoding those
-        coefficients (i.e. another entry in :meth:`_index_weight_fn`). The blocker is purely
-        that the *exact* coefficients must be transcribed from Tsai et al. and unit-tested
-        against the two anchors above (``ell == 1`` reproducing :meth:`shap_values`,
-        ``ell == L`` reproducing :meth:`dividend_values`) plus a small-``L`` weighted
-        least-squares brute force -- rather than hard-coded from memory. Until that check is
-        in place this raises, so no unverified index silently enters an analysis.
+            E^{F-Shap}_S(v, ell) = a(v, S)
+                + (-1)^{ell-s} (s/(ell+s)) C(ell, s)
+                  * sum_{T superset S, |T| > ell}  [ C(|T|-1, ell) / C(|T|+ell-1, ell+s) ] a(v, T),
 
-        Raises:
-            NotImplementedError: always, with guidance to use :meth:`dividend_values`
-                (the ``ell == L`` case, no smearing) or :meth:`shap_interaction_values`
-                (SII) in the meantime.
+        i.e. the dividend of ``S`` plus a fixed linear combination of the *higher* dividends
+        of supersets ``T`` with ``|T| > ell``. It is therefore *exact* (equals the dividends,
+        no smearing) precisely when the true maximum interaction order is ``<= ell``; when the
+        true order exceeds ``ell`` it redistributes that higher-order epistasis down into the
+        ``<= ell`` terms (a projection-induced smearing, distinct from SII's context-averaging).
+
+        Implementation
+        --------------
+        Rather than fold Eq. (16) into a single R-weight (its redistribution couples different
+        tuple sizes, so it is not a per-order ``g_k(s)``), Faith-Shap is assembled as an
+        explicit linear map on the already-validated dividends: this method computes ``a(S)``
+        for the requested tuples and ``a(T)`` for the supersets ``T`` (``ell < |T| <=
+        order_cap``) via :meth:`dividend_values`, then applies the Eq. (16) coefficients
+        (:meth:`_faith_shap_coeff`). This reuses the verified dividend GKT path, keeps the new
+        logic to the coefficient bookkeeping, and makes the covariance compose exactly as
+        ``M @ cov_a @ M.T`` (a fixed linear map ``M`` applied to the joint dividend covariance).
+
+        Tail truncation (``order_cap``)
+        -------------------------------
+        Eq. (16)'s tail runs over *all* supersets up to size ``L``. For an EXACT Faith-Shap,
+        ``order_cap`` must be ``L`` (the default when ``order_cap is None``). Setting
+        ``order_cap < L`` additionally truncates the tail sum -- a genuine approximation that
+        drops the contribution of dividends above ``order_cap``. This is only advisable when
+        those high-order dividends are known/expected to be negligible (e.g. sparse, low-order
+        epistasis); the value is then Faith-Shap of the ``order_cap``-order truncation of the
+        model. The default keeps it exact.
+
+        Args:
+            x: target sequence (string over the alphabet, or one-hot ``(L, A)``).
+            pi: background distribution ``(L, A)``, row-stochastic. (Uniform ``pi`` gives an
+                average-background explanation; a one-hot ``pi`` at a wild-type sequence gives
+                a wild-type-referenced explanation -- see :func:`make_background`.)
+            order_max: the Faith-Shap maximum interaction order ``ell`` (>= 1). Reported tuples
+                must have size ``<= ell``.
+            interactions: explicit tuples ``S`` to score (each ``|S| <= order_max``). If None,
+                all size-``order`` subsets of ``indices`` are enumerated.
+            order: size to enumerate when ``interactions`` is None (default 2). Must be
+                ``<= order_max``.
+            eta: background-channel scale. Default 1.0.
+            indices: universe of positions when enumerating (default all).
+            calc_covar: if True, also return the posterior covariance of the reported tuples.
+            use_double: run in float64 (recommended; the weights are near-cancelling).
+            order_cap: highest dividend order to include in the tail sum (default ``L``, exact).
+
+        Returns:
+            ``(interactions, phi)`` if ``calc_covar`` is False, else ``(interactions, phi, cov)``,
+            with ``phi`` of shape ``(n,)`` and ``cov`` of shape ``(n, n)`` over the reported
+            tuples (row/col order == returned ``interactions``).
+
+        Verify with ``shap_brute_force.ShapBruteForce.bf_faith_shap_values`` (weighted
+        least-squares brute force) and the anchors ``order_max == 1`` -> :meth:`shap_values`,
+        ``order_max == self.seq_length`` -> :meth:`dividend_values`.
         """
-        raise NotImplementedError(
-            "Truncated Faith-Shap (order_max < L) is specified but not implemented: the "
-            "exact redistribution weights must be transcribed and unit-tested against "
-            "Tsai, Yeh & Ravikumar (2023) (and the ell==1 -> Shapley, ell==L -> dividend "
-            "limits) before use. Use dividend_values for the ell==L case (no smearing) or "
-            "shap_interaction_values for SII in the meantime."
+        L = self.seq_length
+        ell = int(order_max)
+        if ell < 1 or ell > L:
+            raise ValueError(f"order_max (ell) must be in [1, {L}]; got {order_max}.")
+        cap = L if order_cap is None else int(order_cap)
+        if cap < ell or cap > L:
+            raise ValueError(f"order_cap must be in [ell, L] = [{ell}, {L}]; got {order_cap}.")
+
+        # Reported tuples S (each must have |S| <= ell).
+        S_list = self._resolve_interactions(interactions, order, indices)
+        if any(len(S) > ell for S in S_list):
+            bad = [S for S in S_list if len(S) > ell]
+            raise ValueError(f"Faith-Shap reports tuples of size <= order_max={ell}; "
+                             f"got larger tuples {bad}.")
+
+        idx_universe = list(range(L)) if indices is None else [int(i) for i in indices]
+
+        # Enumerate every dividend tuple we need: the reported S's, plus all supersets T
+        # (ell < |T| <= cap) of any reported S drawn from the same position universe.
+        needed: "set[Tuple[int, ...]]" = set(S_list)
+        for S in S_list:
+            rest = [p for p in idx_universe if p not in set(S)]
+            for extra_k in range(1, len(rest) + 1):
+                for extra in itertools.combinations(rest, extra_k):
+                    T = tuple(sorted(set(S) | set(extra)))
+                    if ell < len(T) <= cap:
+                        needed.add(T)
+        div_tuples = sorted(needed, key=lambda T: (len(T), T))
+        div_index = {T: i for i, T in enumerate(div_tuples)}
+
+        # Dividends a(T) (+ joint covariance) via the validated GKT path.
+        if calc_covar:
+            _, a_vec, a_cov = self.dividend_values(
+                x, pi, interactions=div_tuples, eta=eta,
+                calc_covar=True, use_double=use_double,
+            )
+        else:
+            _, a_vec = self.dividend_values(
+                x, pi, interactions=div_tuples, eta=eta,
+                calc_covar=False, use_double=use_double,
+            )
+        comp = a_vec.dtype
+
+        # Linear map M: E^{F-Shap}_S = a(S) + sum_{T superset S, ell<|T|<=cap} coeff(|S|,|T|,ell) a(T).
+        n = len(S_list)
+        M = a_vec.new_zeros(n, len(div_tuples))
+        for r, S in enumerate(S_list):
+            Sset = set(S); s = len(S)
+            M[r, div_index[S]] += 1.0                     # identity a(S) term
+            for T in div_tuples:
+                if len(T) > ell and Sset.issubset(T):
+                    M[r, div_index[T]] += self._faith_shap_coeff(s, len(T), ell)
+
+        phi = M @ a_vec                                   # (n,)
+        if not calc_covar:
+            return S_list, phi
+        cov = M @ a_cov @ M.T                             # (n, n)
+        return S_list, phi, cov
+
+    def faith_shap_values_batch(
+        self,
+        xs: Sequence[Union[str, torch.Tensor]],
+        pi: torch.Tensor,
+        order_max: int,
+        interactions: Optional[Sequence[Sequence[int]]] = None,
+        order: Optional[int] = 2,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        use_double: bool = True,
+        order_cap: Optional[int] = None,
+    ) -> Tuple[List[Tuple[int, ...]], torch.Tensor]:
+        """Faith-Shap ``E_S(x)`` for many targets against one background ``pi``.
+
+        Loops :meth:`faith_shap_values` over ``xs`` (means only), mirroring
+        :meth:`dividend_values_batch`.
+
+        Returns:
+            ``(interactions, Phi)`` with ``Phi`` of shape ``(len(xs), len(interactions))``.
+        """
+        S_list: Optional[List[Tuple[int, ...]]] = None
+        rows = []
+        for x in xs:
+            S_list, phi = self.faith_shap_values(
+                x, pi, order_max, interactions=interactions, order=order, eta=eta,
+                indices=indices, calc_covar=False, use_double=use_double, order_cap=order_cap,
+            )
+            rows.append(phi)
+        return S_list, torch.stack(rows, dim=0)
+
+    def global_faith_shap_summary(
+        self,
+        xs: Sequence[Union[str, torch.Tensor]],
+        pi: torch.Tensor,
+        order_max: int,
+        interactions: Optional[Sequence[Sequence[int]]] = None,
+        order: Optional[int] = 2,
+        eta: float = 1.0,
+        indices: Optional[Sequence[int]] = None,
+        use_double: bool = True,
+    ) -> Tuple[List[Tuple[int, ...]], Dict[str, torch.Tensor]]:
+        """Global (dataset-level) Faith-Shap summary over a target sample.
+
+        Reduces ``E_S(x)`` over the targets ``xs`` into per-tuple quantities, mirroring
+        :meth:`global_dividend_summary`:
+
+        * ``mean_abs``    -- ``mean_x |E_S(x)|``: global importance of interaction ``S``.
+        * ``mean_signed`` -- ``mean_x E_S(x)``: signed diagnostic.
+        * ``var``         -- ``Var_x E_S(x)``: dispersion of the Faith-Shap value across
+          targets. (Unlike the dividend's ``sobol_unnorm``, this is NOT a clean Sobol index
+          when ``ell < L`` -- truncated Faith-Shap mixes ANOVA orders -- so it is reported as
+          a plain variance, not labelled Sobol.)
+
+        Returns:
+            ``(interactions, summary)`` with ``summary`` a dict of ``(n,)`` tensors.
+        """
+        S_list, Phi = self.faith_shap_values_batch(
+            xs, pi, order_max, interactions=interactions, order=order, eta=eta,
+            indices=indices, use_double=use_double,
         )
+        summary: Dict[str, torch.Tensor] = {
+            "mean_abs": Phi.abs().mean(dim=0),
+            "mean_signed": Phi.mean(dim=0),
+            "var": Phi.var(dim=0, unbiased=False),
+        }
+        return S_list, summary
 
     # ------------------------------------------------------------------ #
     # Public: extensions (specified, not yet implemented)
@@ -1354,6 +1532,90 @@ class ShapKernelTrickComputer:
     #     raise NotImplementedError("Region SHAP is specified but not implemented in v1.")
 
 
+def make_background(
+    mode: str,
+    seq_length: int,
+    alphabet: str,
+    wildtype: Optional[Union[str, torch.Tensor]] = None,
+    empirical_counts: Optional[torch.Tensor] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Build a background distribution ``pi`` (row-stochastic ``(L, A)``) for SHAP.
+
+    The background is the reference every attribution is measured *against*: a dividend or
+    Faith-Shap value explains the target relative to ``E_pi[f]``. The choice is not cosmetic
+    -- it defines the baseline -- so it is made explicit here rather than defaulted silently.
+
+    Modes:
+      * ``'uniform'``   -- ``pi[p, a] = 1/A`` at every position. The "average background":
+        each residue is equally likely. Matches the synthetic validation suite, and gives the
+        functional-ANOVA / Sobol reading for dividends (product background). Use when you want
+        "contribution relative to a random sequence".
+      * ``'wildtype'``  -- ``pi[p, :]`` is the one-hot of the wild-type residue at ``p``. The
+        "wild-type background": attributions are deviations from the WT sequence, i.e. the
+        effect of *mutating away from* wild type. Requires ``wildtype``. NOTE: a one-hot (delta)
+        background is a valid row-stochastic ``pi``; conditional expectations then collapse to
+        substituting WT at the averaged-over positions, which is exactly the WT-referenced game.
+      * ``'empirical'`` -- ``pi[p, a]`` proportional to the per-position residue frequencies in
+        ``empirical_counts`` (shape ``(L, A)``). The "dataset background": residues as common as
+        they are in the data. Use when the natural reference is the observed sequence ensemble
+        rather than a uniform or single-sequence baseline.
+
+    Args:
+        mode: ``'uniform'``, ``'wildtype'``, or ``'empirical'``.
+        seq_length, alphabet: define ``L`` and the ``A`` symbols (index = position in the string).
+        wildtype: required for ``'wildtype'`` -- an ``L``-char string or ``(L, A)`` one-hot.
+        empirical_counts: required for ``'empirical'`` -- non-negative ``(L, A)`` counts/freqs;
+            each row is renormalized to sum to 1.
+        device, dtype: placement / precision of the returned tensor.
+
+    Returns:
+        ``pi`` of shape ``(L, A)``, each row summing to 1.
+    """
+    A = len(alphabet)
+    L = int(seq_length)
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    m = mode.strip().lower()
+
+    if m == "uniform":
+        return torch.full((L, A), 1.0 / A, device=dev, dtype=dtype)
+
+    if m == "wildtype":
+        if wildtype is None:
+            raise ValueError("mode='wildtype' requires `wildtype` (string or (L, A) one-hot).")
+        if isinstance(wildtype, str):
+            if len(wildtype) != L:
+                raise ValueError(f"wildtype string length {len(wildtype)} != seq_length {L}.")
+            sym_to_idx = {c: i for i, c in enumerate(alphabet)}
+            pi = torch.zeros((L, A), device=dev, dtype=dtype)
+            for p, ch in enumerate(wildtype):
+                if ch not in sym_to_idx:
+                    raise ValueError(f"wildtype char '{ch}' at position {p} not in alphabet.")
+                pi[p, sym_to_idx[ch]] = 1.0
+            return pi
+        wt = torch.as_tensor(wildtype, device=dev, dtype=dtype)
+        if wt.shape != (L, A):
+            raise ValueError(f"wildtype one-hot must be ({L}, {A}); got {tuple(wt.shape)}.")
+        return wt
+
+    if m == "empirical":
+        if empirical_counts is None:
+            raise ValueError("mode='empirical' requires `empirical_counts` of shape (L, A).")
+        c = torch.as_tensor(empirical_counts, device=dev, dtype=dtype)
+        if c.shape != (L, A):
+            raise ValueError(f"empirical_counts must be ({L}, {A}); got {tuple(c.shape)}.")
+        if (c < 0).any():
+            raise ValueError("empirical_counts must be non-negative.")
+        row = c.sum(dim=1, keepdim=True)
+        if (row == 0).any():
+            raise ValueError("empirical_counts has an all-zero row; cannot normalize.")
+        return c / row
+
+    raise ValueError(f"unknown background mode '{mode}' (use 'uniform', 'wildtype', 'empirical').")
+
+
 __all__ = [
     "ShapKernelTrickComputer",
+    "make_background",
 ]
