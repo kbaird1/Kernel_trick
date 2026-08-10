@@ -3,11 +3,11 @@ shap_brute_force.py
 ===================
 
 Independent brute-force reference for the SHAP generalized-kernel-trick (GKT)
-computer in ``generalized_kernel_trick_computer.py``.
+computer in ``shap_kernel_trick_computer.py``.
 
 Everything here recomputes SHAP quantities by *direct subset enumeration* -- no
 polynomial layer, no ``apply_R`` / ``apply_RxR``, no ``_shap_z_mean`` /
-``_interaction_z_mean``. The methods read only the raw cached arrays off the composed
+``_shap_z_interaction``. The methods read only the raw cached arrays off the composed
 ``KernelTrickComputer`` (``site_kernels``, ``_train_x``, ``Qy``, ``S``) and enumerate,
 so agreement with the GKT path is genuine evidence of correctness rather than a
 shared-bug coincidence.
@@ -19,7 +19,7 @@ test/verification tool, not a production path).
 Usage::
 
     from kernel_trick_computer_refactored import KernelTrickComputer
-    from generalized_kernel_trick_computer import ShapKernelTrickComputer
+    from shap_kernel_trick_computer import ShapKernelTrickComputer
     from shap_brute_force import ShapBruteForce
 
     ktc  = KernelTrickComputer(model, alphabet, seq_length)
@@ -31,36 +31,52 @@ Usage::
     torch.allclose(shap.shap_values(x_oh, pi),            bf.bf_shap_values(x_oh, pi))
     torch.allclose(shap.shap_values(x_oh, pi, calc_covar=True)[1],
                    bf.bf_shap_covariance(x_oh, pi))
-    # interactions
+    # SII interactions
     Ts = [(0, 1), (0, 2, 4)]
-    torch.allclose(shap.shap_interaction_values(x_oh, pi, Ts),
+    torch.allclose(shap.shap_interaction_values(x_oh, pi, Ts)[1],
                    bf.bf_shap_interaction_values(x_oh, pi, Ts))
-    torch.allclose(shap.shap_interaction_values(x_oh, pi, Ts, calc_covar=True)[1],
+    torch.allclose(shap.shap_interaction_values(x_oh, pi, Ts, calc_covar=True)[2],
                    bf.bf_shap_interaction_covariance(x_oh, pi, Ts))
+    # Harsanyi dividends (full-order Faith-Shap)
+    torch.allclose(shap.dividend_values(x_oh, pi, Ts)[1],
+                   bf.bf_dividend_values(x_oh, pi, Ts))
+    torch.allclose(shap.dividend_values(x_oh, pi, Ts, calc_covar=True)[2],
+                   bf.bf_dividend_covariance(x_oh, pi, Ts))
 
 The ``convention`` argument ('shap' / 'sii') mirrors
 ``ShapKernelTrickComputer.shap_interaction_values`` exactly, and is reimplemented here
 (rather than imported) so the reference stays independent of the code under test.
 
+Changes in this revision
+------------------------
+* ``_bf_norm_factor`` now matches the GKT's ``'shap'`` normalization at *every* order
+  (``1 / k!``), not just orders 1 and 2. The previous ``0.5 if k == 2 else 1.0`` silently
+  disagreed with ``shap_interaction_values(normalize='shap')`` for ``k >= 3`` (a factor of
+  ``k!``), so order-``>= 3`` ``'shap'`` interactions were never actually validated. Both
+  sides now use ``1 / k!``. (This is a convention choice, not a canonical constant --
+  Lundberg only defines ``k == 2`` -- but the reference must match the code under test.)
+* Added ``bf_dividend_values`` / ``bf_dividend_covariance`` (and the explicit
+  ``_bf_dividend_row``): the ``S = empty`` case of the interaction reference, validating
+  ``ShapKernelTrickComputer.dividend_values``.
+
 Migration note
 --------------
-These methods previously lived on ``ShapKernelTrickComputer`` as ``bf_*`` / ``_bf_*``.
-Call sites (e.g. ``test_gkt_brute.py``) should now build a ``ShapBruteForce`` and call
-the identically named methods on it: ``shap.bf_shap_values(...)`` becomes
-``ShapBruteForce(shap).bf_shap_values(...)``.
+The GKT/SHAP module was split; ``ShapKernelTrickComputer`` now lives in
+``shap_kernel_trick_computer.py`` (previously ``generalized_kernel_trick_computer.py``,
+which remains as a re-export shim). Either import path resolves the same class.
 """
 
 from __future__ import annotations
 
 import itertools
-from math import exp, lgamma
+from math import exp, lgamma, factorial
 from typing import Optional, Sequence, Tuple
 
 import torch
 
 
 class ShapBruteForce:
-    """Enumeration-based reference for first-order and interaction SHAP.
+    """Enumeration-based reference for first-order, interaction, and dividend SHAP.
 
     Args:
         shap_or_ktc: either a ``ShapKernelTrickComputer`` (preferred) or a bare
@@ -97,11 +113,18 @@ class ShapBruteForce:
 
     @staticmethod
     def _bf_norm_factor(k: int, convention: str) -> float:
-        """Convention scale, matching ``ShapKernelTrickComputer._norm_factor``."""
+        """Convention scale, matching ``ShapKernelTrickComputer.shap_interaction_values``.
+
+        The GKT applies ``1 / k!`` for ``normalize='shap'`` at *every* order (== 1/2 at
+        ``k == 2``, matching the notes / Lundberg; a no-op at ``k == 1``), and ``1.0`` for
+        ``normalize='sii'``. This mirrors that exactly. (Earlier this returned
+        ``0.5 if k == 2 else 1.0``, which disagreed with the GKT for ``k >= 3`` and left
+        those orders unvalidated.)
+        """
         if convention == "sii":
             return 1.0
         if convention == "shap":
-            return 0.5 if k == 2 else 1.0
+            return 1.0 / factorial(k)
         raise ValueError(f"unknown convention '{convention}' (use 'shap' or 'sii').")
 
     @staticmethod
@@ -256,7 +279,45 @@ class ShapBruteForce:
         return torch.stack(out)
 
     # ------------------------------------------------------------------ #
-    # Explicit full-space rows -> covariance (first order and interaction)
+    # Harsanyi dividends (full-order Faith-Shap) -- the S = empty case
+    # ------------------------------------------------------------------ #
+
+    def bf_dividend_values(
+        self,
+        x_onehot: torch.Tensor,
+        pi: torch.Tensor,
+        interactions,
+    ) -> torch.Tensor:
+        """Harsanyi dividends by direct enumeration of the discrete derivative at ``S = empty``.
+
+            a(T) = Delta_T f_x(empty) = sum_{W subseteq T} (-1)^{|T|-|W|} f_x(W).
+
+        The reference for ``ShapKernelTrickComputer.dividend_values`` (mean). This is
+        exactly the ``S = empty``, unit-weight, no-``k!`` case of
+        :meth:`bf_shap_interaction_values`, but written out separately so the two code
+        paths stay independent. ``interactions`` is a list of position tuples (or a single
+        flat tuple).
+        """
+        L = self.seq_length
+        x_idx = self._bf_onehot_to_idx(x_onehot)
+        pi = pi.to(device=self.device)
+        interactions = self._normalize_interactions(interactions)
+
+        out = []
+        for T in interactions:
+            Tset = set(T)
+            k = len(Tset)
+            members = sorted(Tset)
+            acc = self.bf_posterior_mean([int(c) for c in x_idx]).new_zeros(())
+            for wsz in range(k + 1):
+                for W in itertools.combinations(members, wsz):
+                    sign = (-1.0) ** (k - len(W))
+                    acc = acc + sign * self.bf_conditional_expectation(tuple(W), x_idx, pi)
+            out.append(acc)
+        return torch.stack(out)
+
+    # ------------------------------------------------------------------ #
+    # Explicit full-space rows -> covariance (first order / interaction / dividend)
     # ------------------------------------------------------------------ #
 
     def _bf_all_seqs_idx(self) -> torch.Tensor:
@@ -351,6 +412,35 @@ class ShapBruteForce:
                 row = row + gw * diff * base
         return row                                                        # (N,)
 
+    def _bf_dividend_row(
+        self, T: Sequence[int], x_idx: torch.Tensor, pi: torch.Tensor, all_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Explicit dividend row ``m^T`` over all sequences (``S = empty`` only, unit weight).
+
+            m^T_z = prod_{p in T} (delta_p - pi_p)  prod_{p not in T} pi_p.
+
+        The ``S = empty``, weight-1 term of :meth:`_bf_interaction_row` -- the row whose
+        posterior functional is the Harsanyi dividend ``a(T)``.
+        """
+        L, A = self.seq_length, self.n_alleles
+        dtype = pi.dtype
+        N = all_idx.shape[0]
+        x_idx = x_idx.to(self.device)
+        pi = pi.to(self.device)
+        Tset = set(int(p) for p in T)
+
+        z = all_idx                                                       # (N, L)
+        delta = (z == x_idx.view(1, L)).to(dtype).T                       # (L, N)
+        piz = pi[torch.arange(L).view(L, 1), z.T]                         # (L, N)
+
+        row = torch.ones(N, dtype=dtype, device=self.device)
+        for p in range(L):
+            if p in Tset:
+                row = row * (delta[p] - piz[p])
+            else:
+                row = row * piz[p]
+        return row                                                        # (N,)
+
     def _bf_covariance_from_rows(self, rows: torch.Tensor, all_idx: torch.Tensor) -> torch.Tensor:
         """Posterior covariance from explicit rows: ``R - (m K_{*,X}) S S^T (m K_{*,X})^T``.
 
@@ -419,6 +509,30 @@ class ShapBruteForce:
         facs = torch.tensor([self._bf_norm_factor(len(T), convention) for T in interactions],
                             device=self.device, dtype=rows.dtype)         # (n,)
         rows = rows * facs[:, None]
+        return self._bf_covariance_from_rows(rows, all_idx)
+
+    def bf_dividend_covariance(
+        self,
+        x_onehot: torch.Tensor,
+        pi: torch.Tensor,
+        interactions,
+    ) -> torch.Tensor:
+        """Dividend posterior covariance by explicit Theorem-1 assembly.
+
+        Reference for ``dividend_values(..., calc_covar=True)``. Builds explicit dividend
+        rows ``m^T`` (``S = empty``, unit weight, no ``k!``) over all ``A^L`` sequences,
+        then assembles ``R - (m K_{*,X}) S S^T (m K_{*,X})^T``. O(A^L) memory,
+        O(A^{2L}) time -- tiny ``L`` only.
+        """
+        L = self.seq_length
+        comp = self.ktc.comp_dtype
+        x_idx = self._bf_onehot_to_idx(x_onehot)
+        pi = pi.to(device=self.device, dtype=comp)
+        interactions = self._normalize_interactions(interactions)
+
+        all_idx = self._bf_all_seqs_idx()                                 # (A^L, L)
+        rows = torch.stack([self._bf_dividend_row(T, x_idx, pi, all_idx)
+                            for T in interactions])                       # (n, A^L)
         return self._bf_covariance_from_rows(rows, all_idx)
 
 
