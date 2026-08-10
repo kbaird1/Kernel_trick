@@ -1487,6 +1487,7 @@ class ShapKernelTrickComputer:
         eta: float = 1.0,
         indices: Optional[Sequence[int]] = None,
         use_double: bool = True,
+        order_cap: Optional[int] = None,
     ) -> Tuple[List[Tuple[int, ...]], Dict[str, torch.Tensor]]:
         """Global (dataset-level) Faith-Shap summary over a target sample.
 
@@ -1500,12 +1501,23 @@ class ShapKernelTrickComputer:
           when ``ell < L`` -- truncated Faith-Shap mixes ANOVA orders -- so it is reported as
           a plain variance, not labelled Sobol.)
 
+        Args:
+            xs, pi, order_max, interactions, order, eta, indices, use_double: as in
+                :meth:`faith_shap_values_batch`.
+            order_cap: highest dividend order to include in the Faith-Shap tail sum,
+                forwarded to :meth:`faith_shap_values` for every target (default ``L``,
+                i.e. exact). On long sequences with ``ell < L`` the exact tail runs over
+                ~``2^(L - ell)`` supersets and is intractable; pass a low ``order_cap``
+                (e.g. ``order_max + 1``) for a tractable, truncated approximation. Only
+                affects the ``ell < L`` case -- when ``order_max >= L`` Faith-Shap equals
+                the dividends and the tail is empty regardless.
+
         Returns:
             ``(interactions, summary)`` with ``summary`` a dict of ``(n,)`` tensors.
         """
         S_list, Phi = self.faith_shap_values_batch(
             xs, pi, order_max, interactions=interactions, order=order, eta=eta,
-            indices=indices, use_double=use_double,
+            indices=indices, use_double=use_double, order_cap=order_cap,
         )
         summary: Dict[str, torch.Tensor] = {
             "mean_abs": Phi.abs().mean(dim=0),
@@ -1531,6 +1543,272 @@ class ShapKernelTrickComputer:
     #     """
     #     raise NotImplementedError("Region SHAP is specified but not implemented in v1.")
 
+    # =====================================================================
+
+
+    # ------------------------------------------------------------------ #
+    # Vectorized (batched-over-targets) global builders
+    # ------------------------------------------------------------------ #
+    #
+    # Motivation: the per-target loops in *_batch / global_* are launch-bound --
+    # each target rebuilds the SAME shared pi-channel c0 and fires many tiny GPU
+    # kernels. But c0 is target-INDEPENDENT and only the fixed-channel c1 depends
+    # on x, so a whole batch of targets can be pushed through the polynomial layer
+    # at once (the primitives broadcast over a leading B axis). This turns
+    # ~B tiny passes into one big pass. Verified equivalent to the per-target
+    # methods (probe_batch_indices.py) to ~1e-12.
+
+    def _auto_batch_size(self, extra_deg: int = 1) -> int:
+        """Pick a target-batch size B from free memory and the (B, L, t) footprint.
+
+        Peak memory of a batched build is dominated by coefficient tensors of shape
+        ``(B, t, <=L+1)`` in the working dtype. We size B so a conservative fraction
+        of the free GPU memory holds a few such tensors at once, then clamp to a sane
+        range. On CPU (no reliable free-memory query) we fall back to a fixed modest
+        chunk. ``extra_deg`` pads the per-target degree budget for the SII/first-order
+        coefficient arrays (dividends need only degree 1).
+
+        This is a closed-form estimate, not a guess: the footprint is exactly
+        ``B * t * (L + extra_deg) * itemsize`` per live coefficient tensor, and we
+        budget for ~4 of them.
+        """
+        L, t = self.seq_length, self.ktc._train_x.reshape(-1, self.seq_length, self.n_alleles).shape[0]
+        itemsize = torch.tensor([], dtype=self.ktc.comp_dtype).element_size()
+        per_target = 4 * t * (L + extra_deg) * itemsize     # ~4 live coeff tensors
+        dev = self.device
+        is_cuda = str(dev).startswith("cuda") or (hasattr(dev, "type") and dev.type == "cuda")
+        if is_cuda:
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(dev)
+            except Exception:  # noqa: BLE001
+                free_bytes = 2 * (1024 ** 3)                # 2 GB fallback
+            budget = 0.25 * free_bytes                       # conservative headroom
+            B = int(max(1, budget // max(1, per_target)))
+        else:
+            B = 1024                                         # fixed modest CPU chunk
+        return int(min(max(B, 64), 20000))                   # clamp to [64, 20000]
+
+    def _batched_channels(self, xs, pi, eta: float):
+        """Batched (c0, c1) for a list of targets. c0 is (L, t) [shared]; c1 is (B, L, t).
+
+        Mirrors :meth:`_mean_channels` but builds the fixed-channel for the whole
+        batch in one einsum. Verified bit-identical to stacking per-target
+        :meth:`_mean_channels` (probe_batch_indices.py).
+        """
+        L, A = self.seq_length, self.n_alleles
+        comp = self.ktc.comp_dtype
+        Xtr = self.ktc._train_x.reshape(-1, L, A).to(comp)                       # (t, L, A)
+        pi_b = pi.to(device=self.device, dtype=comp).unsqueeze(0)                # (1, L, A)
+        zeta = self.ktc.compute_zeta_pc(pi_b, eta)[0]                            # (L, A)
+        c0 = torch.einsum("la,tla->lt", zeta, Xtr)                               # (L, t) shared
+        site = self.ktc.site_kernels.to(comp)                                    # (L, A, A)
+        Xoh = torch.stack([self.target_to_onehot(x).to(comp) for x in xs])       # (B, L, A)
+        Ax = torch.einsum("blc,lca->bla", Xoh, site)                             # (B, L, A)
+        c1 = torch.einsum("bla,tla->blt", Ax, Xtr)                               # (B, L, t)
+        return c0, c1
+
+    def _batched_index_rows(self, c0, c1, interactions, weight_fn):
+        """Batched mK rows for one chunk: returns (B, n_tuples, t).
+
+        The batched analogue of :meth:`_shap_z_interaction`: every position in a
+        tuple T takes the degree-0 factor (c1-c0) (shape (B, t, 1)), every other
+        position the degree-1 factor [c0, c1] (broadcast to (B, t, 2)); the product
+        over positions and the R-contraction run with a leading B axis untouched.
+        """
+        L = self.seq_length
+        B, t = c1.shape[0], c1.shape[2]
+        c0b = c0.unsqueeze(0).expand(B, L, t)                                    # (B, L, t)
+        rows = []
+        for T in interactions:
+            Tset = set(T)
+            g_k = weight_fn(len(Tset)).to(c1.dtype)
+            factors = []
+            for p in range(L):
+                if p in Tset:
+                    factors.append((c1[:, p, :] - c0b[:, p, :]).unsqueeze(-1))   # (B, t, 1)
+                else:
+                    factors.append(torch.stack([c0b[:, p, :], c1[:, p, :]], -1)) # (B, t, 2)
+            coeffs = poly_prod_over_positions(factors)                           # (B, t, L-|T|+1)
+            rows.append(apply_R(coeffs, g_k))                                    # (B, t)
+        return torch.stack(rows, dim=1)                                          # (B, n, t)
+
+    def dividend_values_batch_vectorized(
+        self, xs, pi, interactions=None, order=2, eta: float = 1.0,
+        indices=None, use_double: bool = True, batch_size=None,
+    ):
+        """Vectorized-over-targets dividends. Returns ``(interactions, A)`` with
+        ``A`` of shape ``(len(xs), n_tuples)`` -- identical to
+        :meth:`dividend_values_batch` but computed in target-chunks that share the
+        channel build. Verified equal to the per-target path (~1e-12).
+        """
+        if use_double:
+            self.ktc.set_precision(use_double=True)
+        comp = self.ktc.comp_dtype
+        pi = pi.to(device=self.device, dtype=comp)
+        self.ktc.validate_pis(pi)
+        T_list = self._resolve_interactions(interactions, order, indices)
+        wfn = self._index_weight_fn("dividend")
+        Qy = self.ktc.Qy.to(comp)
+        B = batch_size or self._auto_batch_size(extra_deg=1)
+        out = []
+        for s in range(0, len(xs), B):
+            chunk = xs[s:s + B]
+            c0, c1 = self._batched_channels(chunk, pi, eta)
+            mK = self._batched_index_rows(c0, c1, T_list, wfn)                   # (b, n, t)
+            out.append(mK @ Qy)                                                  # (b, n)
+        return T_list, torch.cat(out, dim=0)
+
+    def interaction_values_batch_vectorized(
+        self, xs, pi, interactions=None, order=2, eta: float = 1.0,
+        indices=None, normalize: str = "sii", use_double: bool = True, batch_size=None,
+    ):
+        """Vectorized-over-targets SII (or 'shap'-normalized) interaction values.
+        Returns ``(interactions, Phi)`` with ``Phi`` of shape ``(len(xs), n_tuples)``,
+        matching a per-target :meth:`shap_interaction_values` loop (~1e-12).
+        """
+        if normalize not in ("shap", "sii"):
+            raise ValueError("normalize must be 'shap' or 'sii'.")
+        if use_double:
+            self.ktc.set_precision(use_double=True)
+        comp = self.ktc.comp_dtype
+        pi = pi.to(device=self.device, dtype=comp)
+        self.ktc.validate_pis(pi)
+        T_list = self._resolve_interactions(interactions, order, indices)
+        wfn = self._g_for_order  # SII weight
+        if normalize == "shap":
+            scale = torch.tensor([1.0 / factorial(len(T)) for T in T_list],
+                                 device=self.device, dtype=comp)
+        else:
+            scale = torch.ones(len(T_list), device=self.device, dtype=comp)
+        Qy = self.ktc.Qy.to(comp)
+        B = batch_size or self._auto_batch_size(extra_deg=1)
+        out = []
+        for s in range(0, len(xs), B):
+            chunk = xs[s:s + B]
+            c0, c1 = self._batched_channels(chunk, pi, eta)
+            mK = self._batched_index_rows(c0, c1, T_list, wfn)                   # (b, n, t)
+            phi = mK @ Qy                                                        # (b, n)
+            out.append(scale.unsqueeze(0) * phi)
+        return T_list, torch.cat(out, dim=0)
+
+    def shap_values_batch_vectorized(
+        self, xs, pi, eta: float = 1.0, indices=None,
+        use_double: bool = True, batch_size=None,
+    ):
+        """Vectorized-over-targets first-order SHAP values. Returns a tensor of shape
+        ``(len(xs), len(indices))``, matching :meth:`shap_values_batch` (~1e-12).
+
+        Uses the batched channels + the first-order prefix/suffix trick, generalized
+        to a leading B axis.
+        """
+        if use_double:
+            self.ktc.set_precision(use_double=True)
+        comp = self.ktc.comp_dtype
+        pi = pi.to(device=self.device, dtype=comp)
+        self.ktc.validate_pis(pi)
+        L = self.seq_length
+        idx = list(range(L)) if indices is None else [int(i) for i in indices]
+        g = self.g.to(comp)
+        Qy = self.ktc.Qy.to(comp)
+        B = batch_size or self._auto_batch_size(extra_deg=1)
+        out = []
+        for s in range(0, len(xs), B):
+            chunk = xs[s:s + B]
+            c0, c1 = self._batched_channels(chunk, pi, eta)                      # (L,t),(B,L,t)
+            b, t = c1.shape[0], c1.shape[2]
+            c0b = c0.unsqueeze(0).expand(b, L, t)                                # (B,L,t)
+            factors = torch.stack([c0b, c1], dim=-1)                             # (B,L,t,2)
+            ones = c1.new_ones(b, t, 1)
+            prefix = [ones] * L
+            for p in range(1, L):
+                prefix[p] = poly_prod_over_positions([prefix[p - 1], factors[:, p - 1]])
+            suffix = [ones] * L
+            for p in range(L - 2, -1, -1):
+                suffix[p] = poly_prod_over_positions([suffix[p + 1], factors[:, p + 1]])
+            cols = []
+            for i in idx:
+                prod_not_i = poly_prod_over_positions([prefix[i], suffix[i]])    # (B,t,<=L)
+                R_val = apply_R(prod_not_i, g)                                   # (B,t)
+                mK_i = (c1[:, i, :] - c0b[:, i, :]) * R_val                      # (B,t)
+                cols.append(mK_i @ Qy)                                           # (B,)
+            out.append(torch.stack(cols, dim=1))                                 # (B, len(idx))
+        return torch.cat(out, dim=0)
+
+    def faith_shap_values_batch_vectorized(
+        self, xs, pi, order_max, interactions=None, order=2, eta: float = 1.0,
+        indices=None, use_double: bool = True, order_cap=None, batch_size=None,
+    ):
+        """Vectorized-over-targets truncated Faith-Shap E_S(x).
+
+        Returns ``(S_list, Phi)`` with ``Phi`` of shape ``(len(xs), len(S_list))`` --
+        identical to a per-target :meth:`faith_shap_values` loop, but the dividends it
+        rests on are computed with :meth:`dividend_values_batch_vectorized` (shared
+        channel build across the target chunk) and the target-INDEPENDENT Eq. 16
+        redistribution map ``M`` is applied once as a matmul.
+
+        Why this is safe / correct
+        --------------------------
+        Faith-Shap is ``E_S = a(S) + sum_{T superset S, ell<|T|<=cap} coeff(|S|,|T|,ell) a(T)``
+        -- a fixed linear map ``M`` on the dividend vector ``a``. ``M`` and the set of
+        dividend tuples it needs depend only on (reported tuples, ell, cap), NOT on the
+        target, so they are built once. The ``needed``-set enumeration and ``M``
+        construction below are the SAME code as :meth:`faith_shap_values` (reproduced,
+        not refactored, to keep that verified method untouched); the batch dividends are
+        the verified vectorized path. probe_faith_batch.py checks both the per-target
+        equivalence and the ``order_max == L`` -> dividends anchor.
+
+        Only the ell < L case is meaningfully different from dividends; at ell >= L the
+        tail is empty, ``M`` is the identity, and this returns the (vectorized) dividends.
+        """
+        L = self.seq_length
+        ell = int(order_max)
+        if ell < 1 or ell > L:
+            raise ValueError(f"order_max (ell) must be in [1, {L}]; got {order_max}.")
+        cap = L if order_cap is None else int(order_cap)
+        if cap < ell or cap > L:
+            raise ValueError(f"order_cap must be in [ell, L] = [{ell}, {L}]; got {order_cap}.")
+
+        # Reported tuples S (each |S| <= ell) -- identical resolution to faith_shap_values.
+        S_list = self._resolve_interactions(interactions, order, indices)
+        if any(len(S) > ell for S in S_list):
+            bad = [S for S in S_list if len(S) > ell]
+            raise ValueError(f"Faith-Shap reports tuples of size <= order_max={ell}; "
+                             f"got larger tuples {bad}.")
+
+        idx_universe = list(range(L)) if indices is None else [int(i) for i in indices]
+
+        # ---- needed dividend tuples: reported S's + supersets T (ell<|T|<=cap) ----
+        # (verbatim from faith_shap_values so div_tuples order matches the M columns)
+        import itertools as _it
+        needed = set(S_list)
+        for S in S_list:
+            rest = [p for p in idx_universe if p not in set(S)]
+            for extra_k in range(1, len(rest) + 1):
+                for extra in _it.combinations(rest, extra_k):
+                    T = tuple(sorted(set(S) | set(extra)))
+                    if ell < len(T) <= cap:
+                        needed.add(T)
+        div_tuples = sorted(needed, key=lambda T: (len(T), T))
+        div_index = {T: i for i, T in enumerate(div_tuples)}
+
+        # ---- target-independent Eq. 16 map M: (n_S, n_div) ----
+        comp = self.ktc.comp_dtype
+        n = len(S_list)
+        M = torch.zeros(n, len(div_tuples), device=self.device, dtype=comp)
+        for r, S in enumerate(S_list):
+            Sset = set(S); s = len(S)
+            M[r, div_index[S]] += 1.0                      # identity a(S) term
+            for T in div_tuples:
+                if len(T) > ell and Sset.issubset(T):
+                    M[r, div_index[T]] += self._faith_shap_coeff(s, len(T), ell)
+
+        # ---- batched dividends a(T)(x) for ALL needed tuples, then Phi = A @ M^T ----
+        _, A = self.dividend_values_batch_vectorized(
+            xs, pi, interactions=div_tuples, eta=eta,
+            use_double=use_double, batch_size=batch_size,
+        )                                                  # (n_x, n_div)
+        Phi = A @ M.T                                      # (n_x, n_S)
+        return S_list, Phi
 
 def make_background(
     mode: str,
