@@ -791,22 +791,28 @@ class SequenceFunctionAnalysis:
         all_T = positions + inter_tuples
         want_cov = self.cfg.local_covariance
 
-        def diag_sd(cov):
-            # posterior sd of each term = sqrt of the covariance diagonal (clamped
-            # to guard tiny negative round-off before the sqrt).
-            d = torch.diagonal(cov)
-            return _to_np(torch.sqrt(torch.clamp(d, min=0.0)))
+        def var_sd(var):
+            # posterior sd of each term = sqrt of its variance (clamped to guard tiny
+            # negative round-off). Input is the 1-D per-term variance vector returned
+            # by covariance="diag".
+            return _to_np(torch.sqrt(torch.clamp(var, min=0.0)))
 
         if want_cov:
-            phi, _ = shap.shap_values(tgt, pi, indices=list(range(self.L)), calc_covar=True)
-            sii_T, sii, sii_cov = shap.shap_interaction_values(
-                tgt, pi, interactions=all_T, normalize="sii", calc_covar=True)
-            fs_T, fs, fs_cov = shap.faith_shap_values(
+            # covariance="diag": each method returns per-term VARIANCES (1-D), not a
+            # full matrix -- all these local tables consume is sqrt(diag), so the diag
+            # path is O(n) in tuples instead of O(n^2). (Default is still "full"; we
+            # opt in explicitly here.)
+            phi, _ = shap.shap_values(tgt, pi, indices=list(range(self.L)),
+                                      calc_covar=True, covariance="diag")
+            sii_T, sii, sii_var = shap.shap_interaction_values(
+                tgt, pi, interactions=all_T, normalize="sii",
+                calc_covar=True, covariance="diag")
+            fs_T, fs, fs_var = shap.faith_shap_values(
                 tgt, pi, order_max=ell, interactions=all_T, calc_covar=True,
-                order_cap=self._faith_cap)
-            dv_T, dv, dv_cov = shap.dividend_values(
-                tgt, pi, interactions=all_T, calc_covar=True)
-            sii_sd, fs_sd, dv_sd = diag_sd(sii_cov), diag_sd(fs_cov), diag_sd(dv_cov)
+                covariance="diag", order_cap=self._faith_cap)
+            dv_T, dv, dv_var = shap.dividend_values(
+                tgt, pi, interactions=all_T, calc_covar=True, covariance="diag")
+            sii_sd, fs_sd, dv_sd = var_sd(sii_var), var_sd(fs_var), var_sd(dv_var)
         else:
             phi = shap.shap_values(tgt, pi, indices=list(range(self.L)))
             sii_T, sii = shap.shap_interaction_values(
@@ -935,29 +941,35 @@ class SequenceFunctionAnalysis:
         fs_sd = np.zeros(len(all_T))
         dv_sd = np.zeros(len(all_T))
 
-        def diag_sd(cov):
-            d = torch.diagonal(cov)
-            return _to_np(torch.sqrt(torch.clamp(d, min=0.0)))
+        def var_sd(var):
+            # sd from the per-term variance vector returned by covariance="diag".
+            return _to_np(torch.sqrt(torch.clamp(var, min=0.0)))
 
         n = len(xs)
         print(f"[global] computing posterior covariance over {n} targets "
               "(--global-covariance)")
         # verbose: tick every 25 targets (finer than the default every-100) with a
         # running rate + ETA, so this long per-target loop shows liveness.
+        # covariance="diag": only per-term variances are needed here (we sum sqrt(diag)
+        # across targets), so each call is O(n) tuples, not O(n^2) -- the diagonal-R
+        # path. Default elsewhere is still "full".
         t0 = time.time()
         tick = 25 if self.cfg.verbose else 100
         for k, x in enumerate(xs, 1):
-            _, pcov = shap.shap_values(x, pi, indices=list(range(self.L)), calc_covar=True)
-            _, _, scov = shap.shap_interaction_values(
-                x, pi, interactions=all_T, normalize="sii", calc_covar=True)
-            _, _, fcov = shap.faith_shap_values(
+            _, pvar = shap.shap_values(x, pi, indices=list(range(self.L)),
+                                       calc_covar=True, covariance="diag")
+            _, _, svar = shap.shap_interaction_values(
+                x, pi, interactions=all_T, normalize="sii",
+                calc_covar=True, covariance="diag")
+            _, _, fvar = shap.faith_shap_values(
                 x, pi, order_max=ell, interactions=all_T, calc_covar=True,
-                order_cap=self._faith_cap)
-            _, _, dcov = shap.dividend_values(x, pi, interactions=all_T, calc_covar=True)
-            pos_sd += diag_sd(pcov)
-            sii_sd += diag_sd(scov)
-            fs_sd += diag_sd(fcov)
-            dv_sd += diag_sd(dcov)
+                covariance="diag", order_cap=self._faith_cap)
+            _, _, dvar = shap.dividend_values(x, pi, interactions=all_T,
+                                              calc_covar=True, covariance="diag")
+            pos_sd += var_sd(pvar)
+            sii_sd += var_sd(svar)
+            fs_sd += var_sd(fvar)
+            dv_sd += var_sd(dvar)
             if k % tick == 0 or k == n:
                 if self.cfg.verbose:
                     rate = k / max(1e-9, time.time() - t0)

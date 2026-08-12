@@ -1810,6 +1810,110 @@ class ShapKernelTrickComputer:
         Phi = A @ M.T                                      # (n_x, n_S)
         return S_list, Phi
 
+
+    def _shap_R_interaction_fast(
+        self, x_onehot, pi, eta, interactions, weight_fn=None,
+    ):
+        """Fast equivalent of :meth:`_shap_R_interaction` via memoized free-position products.
+
+        Same result as the naive n x n loop -- ``R[a,b] = m^{T_a} K m^{T_b}`` -- but
+        instead of rebuilding the full L-position bivariate product per pair, it reuses
+        the product over the positions NOT perturbed by the pair (``free = complement of
+        T_a u T_b``), which is shared across every pair with the same perturbed set. Only
+        the few perturbed positions (<= 2*interaction_order) are convolved in per pair.
+
+        Verified == :meth:`_shap_R_interaction` (probe_R_fast.py, ~1e-12). The naive
+        method is kept as the brute-force-checked reference.
+        """
+        L = self.seq_length
+        if weight_fn is None:
+            weight_fn = self._g_for_order
+        sc = self._cov_scalars(x_onehot, pi, eta)
+        K_ff, K_fa, K_aa = sc["K_ff"], sc["K_fa"], sc["K_aa"]     # each (L,)
+        dtype = K_ff.dtype
+
+        # per-order weight vectors (cached across the pair loop)
+        g_by_order: Dict[int, torch.Tensor] = {}
+
+        def gord(k: int) -> torch.Tensor:
+            g = g_by_order.get(k)
+            if g is None:
+                g = weight_fn(k).to(dtype)
+                g_by_order[k] = g
+            return g
+
+        # ---- per-position blocks (built once) ----
+        # both_free (deg (1,1)): [[aa, fa],[fa, ff]] at each position p.
+        both_free = torch.stack([
+            torch.stack([K_aa, K_fa], dim=-1),
+            torch.stack([K_fa, K_ff], dim=-1),
+        ], dim=-2)                                               # (L, 2, 2)
+
+        def blk_i_only(p):    # p in T_a only  (deg (0,1)) : [[fa-aa, ff-fa]]
+            B = K_ff.new_zeros(1, 2)
+            B[0, 0] = K_fa[p] - K_aa[p]; B[0, 1] = K_ff[p] - K_fa[p]
+            return B
+
+        def blk_j_only(p):    # p in T_b only  (deg (1,0)) : [[fa-aa],[ff-fa]]
+            B = K_ff.new_zeros(2, 1)
+            B[0, 0] = K_fa[p] - K_aa[p]; B[1, 0] = K_ff[p] - K_fa[p]
+            return B
+
+        def blk_both(p):      # p in both      (deg (0,0)) : [[ff-2fa+aa]]
+            B = K_ff.new_zeros(1, 1)
+            B[0, 0] = K_ff[p] - 2.0 * K_fa[p] + K_aa[p]
+            return B
+
+        # ---- memoized product over a FREE position set (complement of perturbed) ----
+        # Key = frozenset(perturbed positions). Value = bivariate coeff tensor of the
+        # product of both_free[p] over p NOT in perturbed. Shared across pairs.
+        free_prod_cache: Dict[frozenset, torch.Tensor] = {}
+
+        def free_product(pert: frozenset) -> torch.Tensor:
+            cached = free_prod_cache.get(pert)
+            if cached is not None:
+                return cached
+            factors = [both_free[p] for p in range(L) if p not in pert]
+            if not factors:
+                prod = K_ff.new_ones(1, 1)                       # empty product -> scalar 1
+            else:
+                prod = poly_prod_over_positions_bivariate(factors)
+            free_prod_cache[pert] = prod
+            return prod
+
+        sets = [set(T) for T in interactions]
+        n = len(sets)
+        R = K_ff.new_zeros(n, n)
+        for a, Ta in enumerate(sets):
+            ga = gord(len(Ta))
+            for b, Tb in enumerate(sets):
+                gb = gord(len(Tb))
+                pert = Ta | Tb
+                pert_fs = frozenset(pert)
+                # perturbed-position blocks (order within pert is irrelevant: conv is assoc/comm)
+                pert_factors = []
+                for p in sorted(pert):
+                    in_a, in_b = (p in Ta), (p in Tb)
+                    if in_a and in_b:
+                        pert_factors.append(blk_both(p))
+                    elif in_a:
+                        pert_factors.append(blk_i_only(p))
+                    else:  # in_b
+                        pert_factors.append(blk_j_only(p))
+                free = free_product(pert_fs)                     # (df, df)
+                if pert_factors:
+                    pert_prod = poly_prod_over_positions_bivariate(pert_factors)
+                    coeffs2 = poly_prod_over_positions_bivariate([free, pert_prod])
+                else:
+                    coeffs2 = free
+                R[a, b] = apply_RxR(coeffs2, ga, gb)
+        return R
+
+
+
+
+
+
 def make_background(
     mode: str,
     seq_length: int,
