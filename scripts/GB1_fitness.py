@@ -800,11 +800,17 @@ class GB1FitnessLandscape:
         for start in range(0, N, batch):
             for ii in target_idx[start:start + batch]:
                 if want_sd:
-                    _, dv, cov = shap.dividend_values(
-                        str(seqs[ii]), pi, interactions=tuples, calc_covar=True)
+                    # covariance="diag" returns the per-tuple posterior VARIANCES as a
+                    # 1-D vector, which is all we store (as sd). The full path built the
+                    # n x n grid and then kept only torch.diagonal(cov) -- O(n^2) work
+                    # for an O(n) answer, once per region-assigned sequence. Numerically
+                    # identical to the old sqrt(diagonal(full cov)) to ~1e-16
+                    # (probe_R_diag.py), so the CSV columns are unchanged.
+                    _, dv, dvar = shap.dividend_values(
+                        str(seqs[ii]), pi, interactions=tuples,
+                        calc_covar=True, covariance="diag")
                     feats[ii] = _to_np(dv)
-                    d = torch.diagonal(cov)
-                    feats_sd[ii] = _to_np(torch.sqrt(torch.clamp(d, min=0.0)))
+                    feats_sd[ii] = _to_np(torch.sqrt(torch.clamp(dvar, min=0.0)))
                 else:
                     _, dv = shap.dividend_values(str(seqs[ii]), pi, interactions=tuples)
                     feats[ii] = _to_np(dv)

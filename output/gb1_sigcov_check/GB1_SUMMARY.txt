@@ -1,0 +1,58 @@
+GB1 fitness-landscape reproduction  (Zhou & McCandlish 2020, Fig. 5)
+====================================================================
+data:            /cluster/tufts/pettilab/kbaird01/Kernel_trick/data/gb1.csv
+kernel / bg:     jenga / uniform
+conditioned on:  20000 seqs   held-out R2 = 0.8085160386644676
+regions (k):     3   method = pcca   (defined by landscape GEOMETRY; SHAP explains, does not define)
+diffusion beta:  1.0   slow modes = -2.47e+00, -3.44e+00
+additive target: measured   high-binding: pred_wt
+
+[5] Landscape fidelity vs paper (paper: regions hold ~97.5% of above-WT seqs and all top-100 binders)
+    above-WT sequences:           3630
+    ... assigned to a region:     3241  (89.3%)
+    top-100 measured binders in a region: 100/100  (100.0%)
+      region 0: 61 of top 100
+      region 1: 30 of top 100
+      region 2: 9 of top 100
+
+[2] Local vs global additivity  (target=measured; paper: 0.77-0.80 within region, 0.49 global)
+    global additive R^2 = 0.487  (n=149361, params=80)
+    region 0: additive R^2 = 0.514  (n=1239, params=55, perm p=0.562)
+    region 1: additive R^2 = 0.614  (n=1480, params=53, perm p=0.00498)
+    region 2: additive R^2 = 0.494  (n=1172, params=53, perm p=0.896)
+    (randomization test: 200 subsets; paper used 1000, reported p < 0.003)
+
+[3a] Per-region residue composition  (paper: sites 41,54 = positions 2,3 carry the differences)
+    region 0: modal=WICA  site41=C(39%)  site54=A(71%)
+    region 1: modal=WILG  site41=L(31%)  site54=G(67%)
+    region 2: modal=VYGM  site41=G(100%)  site54=M(19%)
+    (paper: region1 -> G at 41; region2 -> G at 54, L/F at 41; region3 -> A at 54, C/A at 41)
+
+[3b] SHAP signature per region (paper: additive effects differ 'particularly at sites 41 and 54')
+    region 0 main effects: site39=+0.268  site40=+0.109  site41=+0.829  site54=+0.928
+    region 1 main effects: site39=+0.258  site40=+0.113  site41=+0.666  site54=+1.003
+    region 2 main effects: site39=+0.205  site40=+0.165  site41=+1.995  site54=+0.311
+    41x54 interaction per region: r0=+1.571  r1=+1.747  r2=+1.116
+    MAIN-EFFECT between-region separation (gap / combined SEM), per site:
+    site39: max z=5.6 (regions 0 vs 2)
+      0 vs 1: gap=0.010  z=1.1
+      0 vs 2: gap=0.063  z=5.6
+      1 vs 2: gap=0.053  z=4.6
+    site40: max z=4.9 (regions 0 vs 2)
+      0 vs 1: gap=0.004  z=0.3
+      0 vs 2: gap=0.055  z=4.9
+      1 vs 2: gap=0.052  z=4.8
+    site41: max z=148.9 (regions 1 vs 2)
+      0 vs 1: gap=0.163  z=9.8
+      0 vs 2: gap=1.166  z=80.7
+      1 vs 2: gap=1.329  z=148.9
+    site54: max z=39.4 (regions 1 vs 2)
+      0 vs 1: gap=0.075  z=5.2
+      0 vs 2: gap=0.617  z=35.2
+      1 vs 2: gap=0.692  z=39.4
+    41x54 INTERACTION between-region separation (gap / combined SEM):
+      0 vs 1: gap=0.177  z=6.4
+      0 vs 2: gap=0.455  z=14.6
+      1 vs 2: gap=0.632  z=21.3
+    (read the pairwise z's: a large max-z with one small pair = a 2-vs-1 split, not a three-way separation)
+
