@@ -875,23 +875,38 @@ class ShapKernelTrickComputer:
             ``(len(S_list), len(div_tuples))``; ``tail_empty``.
         """
         needed = set(S_list)
+        tail_by_S: Dict[Tuple[int, ...], List[Tuple[int, ...]]] = {}
         for S in S_list:
             rest = [p for p in idx_universe if p not in set(S)]
-            for extra_k in range(1, len(rest) + 1):
+            # Enumerate only the extra-position COUNTS that can put |T| = |S| + extra_k
+            # inside the (ell, cap] tail window. `cap` bounds the RESULT either way, but
+            # generating every subset of `rest` and filtering afterwards costs 2^|rest|
+            # regardless of cap: 8 steps at L=4, 3.4e10 steps per reported tuple at L=36 --
+            # and it paid that cost even when the window is EMPTY (ell >= L), where there
+            # are no supersets to find. Since extra is disjoint from S, |T| = |S| + extra_k
+            # exactly, so the window is a contiguous range of extra_k and the post-filter
+            # becomes unnecessary rather than merely cheap.
+            lo = max(1, ell - len(S) + 1)
+            hi = min(len(rest), cap - len(S))
+            sup: List[Tuple[int, ...]] = []
+            for extra_k in range(lo, hi + 1):
                 for extra in itertools.combinations(rest, extra_k):
                     T = tuple(sorted(set(S) | set(extra)))
-                    if ell < len(T) <= cap:
-                        needed.add(T)
+                    sup.append(T)
+                    needed.add(T)
+            tail_by_S[S] = sup
         div_tuples = sorted(needed, key=lambda T: (len(T), T))
         div_index = {T: i for i, T in enumerate(div_tuples)}
 
+        # Row r gets the identity term a(S) plus one Eq. (16) term per tail superset of S.
+        # Those supersets are already in hand from the pass above, so we do NOT rescan all
+        # of div_tuples per row (which was O(n_S * n_div): 5.2M subset tests at L=36).
         M = torch.zeros(len(S_list), len(div_tuples), device=self.device, dtype=dtype)
         for r, S in enumerate(S_list):
-            Sset, s = set(S), len(S)
+            s = len(S)
             M[r, div_index[S]] += 1.0                       # identity a(S) term
-            for T in div_tuples:
-                if len(T) > ell and Sset.issubset(T):
-                    M[r, div_index[T]] += self._faith_shap_coeff(s, len(T), ell)
+            for T in tail_by_S[S]:
+                M[r, div_index[T]] += self._faith_shap_coeff(s, len(T), ell)
 
         return div_tuples, M, all(len(T) <= ell for T in div_tuples)
 
@@ -1016,17 +1031,21 @@ class ShapKernelTrickComputer:
     # per-target uncertainty, loop the single-target methods with covariance="diag".
 
     def _auto_batch_size(self, extra_deg: int = 1) -> int:
-        """Choose a target-batch size from free memory and the ``(B, t, L)`` footprint.
+        """Choose a target-batch size from free memory and the per-chunk footprint.
 
-        Peak memory is dominated by coefficient tensors of shape ``(B, t, <=L+1)``, so the
-        cost is exactly ``B * t * (L + extra_deg) * itemsize`` per live tensor; we budget for
-        ~4 of them within a quarter of free GPU memory, then clamp to ``[64, 20000]``. On CPU
+        A batched build holds, simultaneously, the ``L`` per-position factor tensors of
+        shape ``(B, t, 2)`` AND a few coefficient tensors of shape ``(B, t, <=L+1)``, so
+        the footprint is ``B * t * (2L + 4(L + extra_deg)) * itemsize``. Counting only the
+        coefficient tensors (as an earlier version did) understates it by ~L/4 -- fine at
+        L=4, a ~9x under-estimate and a likely OOM at L=36.
+
+        We budget a quarter of free GPU memory, then clamp to ``[64, 20000]``. On CPU
         there is no reliable free-memory query, so a fixed modest chunk is used.
         """
         L = self.seq_length
         t = self.ktc._train_x.reshape(-1, L, self.n_alleles).shape[0]
         itemsize = torch.tensor([], dtype=self.ktc.comp_dtype).element_size()
-        per_target = 4 * t * (L + extra_deg) * itemsize
+        per_target = t * (2 * L + 4 * (L + extra_deg)) * itemsize
         dev = self.device
         is_cuda = str(dev).startswith("cuda") or getattr(dev, "type", None) == "cuda"
         if is_cuda:
