@@ -45,18 +45,18 @@ THE BIALLELIC FACTORIZATION (the identity this script is built around)
 With alphabet {A, B} and background pi^p = (1 - p_p, p_p), the attributed
 position's factor in the SHAP lift (eq. shaplift of the draft) is
 
-    Delta^p = delta^p - pi^p = (z_p - p_p) * (-1, +1),      z_p = 1{x_p == 'B'}
+    Delta^p = delta^p - pi^p = (p_p - z_p) * (+1, -1),      z_p = 1{x_p == 'B'}
 
 an x-INDEPENDENT direction times a scalar. Since Delta^p enters every term of
 the subset sum multiplicatively and nothing else in the sum involves x_p,
 
-    phi_i(x) = (z_i - p_i) * h_i(x_{-i}),
+    phi_i(x) = (p_i - z_i) * h_i(x_{-i}),
 
 where h_i does not depend on locus i's own allele. This is exact: any product
 kernel, any amount of epistasis, no additivity assumption.
 
-  * h_i is the Shapley-context-weighted average effect of substituting B (BY)
-    for A (RM) at locus i. In quantitative-genetics terms it is Fisher's average
+  * h_i is the Shapley-context-weighted average effect of substituting A (RM)
+    for B (BY) at locus i. In quantitative-genetics terms it is Fisher's average
     effect of allele substitution; phi_i is that times centered dosage, i.e.
     locus i's contribution to the breeding value.
   * h_i STILL depends on the rest of the genotype. That dependence is the
@@ -65,9 +65,9 @@ kernel, any amount of epistasis, no additivity assumption.
     that prompted this rewrite.
 
 TWO WAYS TO GET h, BOTH USED, BOTH FROM phi ALONE
-    (a) DIVISION.  h_i = phi_i / (z_i - p_i). One target per genotype, so it is
+    (a) DIVISION.  h_i = phi_i / (p_i - z_i). One target per genotype, so it is
         the cheap route and E2 uses it. Undefined at a background where
-        (z_i - p_i) = 0, i.e. at a parental delta wherever the target matches
+        (p_i - z_i) = 0, i.e. at a parental delta wherever the target matches
         the reference.
     (b) PAIRING.   For two genotypes identical except at locus j,
             h_j = phi_j(x with j = BY) - phi_j(x with j = RM),
@@ -103,12 +103,12 @@ E2  substitution-     phi for many genotypes from a balanced design via
 
 E3  compensating      Two contrasts of the E2 matrix, no further model calls
     loci.             beyond the posterior-s.d. pass:
-                        delta_j = mean(h_j | ENA1 = RM) - mean(h_j | ENA1 = BY)
+                        epsilon_j = mean(h_j | ENA1 = RM) - mean(h_j | ENA1 = BY)
                         m_j     = -[mean(h_ENA1 | j = BY) - mean(h_ENA1 | j = RM)]
-                      delta_j is the source paper's Figure 4E quantity computed
+                      epsilon_j is the source paper's Figure 4E quantity computed
                       through the model: positive means locus j does more work
                       when ENA1 is broken. m_j is the same interaction seen from
-                      ENA1's side; for purely pairwise epistasis delta_j == m_j,
+                      ENA1's side; for purely pairwise epistasis epsilon_j == m_j,
                       so their agreement is a free consistency check and their
                       disagreement is a higher-order diagnostic.
 
@@ -131,7 +131,7 @@ TWO SCOPE LIMITS, STATED UP FRONT
     constant there); --targets segregants covers all 83 at the cost of relying
     on near-random assortment, with the LD table as the caveat. The script
     computes which loci vary and reports it.
-  * Error bars on delta_j are the SEM across the design, not a GP posterior
+  * Error bars on epsilon_j are the SEM across the design, not a GP posterior
     interval. The posterior covariance between attributions at two DIFFERENT
     targets is row 2 of the paper's table with two different row lifts --
     expressible in the framework, but not implemented in the current module,
@@ -174,6 +174,20 @@ import matplotlib.pyplot as plt
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "qtls_li_hq"
 DEFAULT_OUT_DIR = REPO_ROOT / "output" / "ENA1_paper"
+
+# Revision marker. Printed at startup and checked by the SLURM wrapper, so a
+# stale copy on a cluster fails loudly instead of silently producing figures in
+# the old form. BUMP THIS whenever a convention changes.
+SCRIPT_REVISION = "rev9-2026-09-19"
+REVISION_NOTES = (
+    "h_j = phi_j / (p_j - z_j), i.e. the effect of BY -> RM (h_ENA1 NEGATIVE); "
+    "epsilon_j = mean(h_j|BY) - mean(h_j|RM); "
+    "E2 has THREE panels (distribution / per-locus / compensating loci); "
+    "targets default to the measured segregants; --n-targets defaults to ALL; "
+    "E1 also times the per-target posterior variance and its brute-force "
+    "reference, plus an O(n^2) cross-target covariance cost sweep; "
+    "--epsilon-posterior-n turns on GP posterior intervals for epsilon_j"
+)
 
 N_LOCI = 83
 N_LANDSCAPE_BITS = 17          # 16 top QTLs + background pseudo-locus
@@ -218,12 +232,15 @@ PAPER_CONDITIONAL = {
     "HAP1": "deleterious with both alleles",
 }
 
-# Expected sign of delta_j = mean(h_j | ENA1 = RM) - mean(h_j | ENA1 = BY),
-# i.e. "extra effect of switching locus j from RM to BY when ENA1 is broken".
-# Reading PAPER_CONDITIONAL: a locus whose BY allele helps only in the RM
-# background has a larger h_j there, hence delta_j > 0. A locus deleterious with
-# both ENA1 alleles has a similar h_j either way, hence delta_j ~ 0.
-PAPER_DELTA_SIGN = {"HAL9": +1, "PHO84": +1, "MKT1": +1, "HAP1": 0}
+# Expected sign of the epistatic coefficient
+#     eps_j = mean(h_j | ENA1 = BY) - mean(h_j | ENA1 = RM),
+# i.e. "how much more locus j matters when ENA1 carries its deleterious allele".
+# Reading PAPER_CONDITIONAL: a locus whose BY allele helps only in an RM
+# background has a larger |h_j| there, hence eps_j > 0. A locus deleterious with
+# both ENA1 alleles behaves similarly either way, hence eps_j ~ 0.
+# These signs are unchanged from the earlier epsilon_j convention, because
+# flipping h and reversing the subtraction cancel.
+PAPER_EPSILON_SIGN = {"HAL9": +1, "PHO84": +1, "MKT1": +1, "HAP1": 0}
 
 # Colours
 C_BY = "#3B7EA1"        # ENA1 BY (beneficial)
@@ -359,7 +376,22 @@ def allele_indicator(seqs, n_loci: int | None = None) -> np.ndarray:
 
 
 def centering_factor(seqs, pi_np: np.ndarray, alphabet: str) -> np.ndarray:
-    """(n, L) array of (z_p - p_p), the biallelic SHAP multiplier.
+    """(n, L) array of (p_p - z_p), the biallelic SHAP multiplier.
+
+    SIGN CONVENTION. h is defined as the effect of substituting RM for BY, i.e.
+    BY -> RM, so that a genotype which TOLERATES the deleterious RM allele has a
+    SMALL-magnitude h and sits at the right-hand (less negative) end of the
+    distribution. That reads the way the biology does: large negative h means
+    losing the BY allele costs a lot.
+
+    The factorization is therefore written
+
+        phi_i(x) = (p_i - z_i) * h_i(x_{-i}),      h_i = effect of BY -> RM
+
+    which is the earlier (z_i - p_i) convention with both factors negated. THIS
+    FUNCTION IS THE ONLY PLACE THE CONVENTION IS SET for the division route;
+    h_by_pairing carries the matching flip and the two are cross-checked
+    against each other in E1 and again in E2.
 
     Bounded away from zero only for a strictly interior background: under a
     delta pi it is exactly 0 wherever the target matches the reference, and the
@@ -368,7 +400,7 @@ def centering_factor(seqs, pi_np: np.ndarray, alphabet: str) -> np.ndarray:
     """
     z = allele_indicator(seqs, pi_np.shape[0]).astype(float)
     p = pi_np[:, b_index(alphabet)][None, :]
-    return z - p
+    return p - z
 
 
 def pi_from_t(sfa, t: float):
@@ -541,6 +573,11 @@ def marginal_effects(X: np.ndarray, y: np.ndarray) -> pd.DataFrame:
 
     eff = pd.DataFrame(out)
     eff["gene"] = eff["locus"].map(GENE_BY_LOCUS)
+    # NAME IS DELIBERATE. This is |delta_B_minus_A|, the RAW-DATA per-locus
+    # mean fitness difference -- nothing to do with epsilon_j, the epistatic
+    # coefficient of E3. A global rename of "abs_delta" to "abs_epsilon"
+    # caught this column by accident and half-renamed it, so keep the two
+    # names distinct.
     eff["abs_delta"] = eff["delta_B_minus_A"].abs()
     # 'B' is the beneficial letter wherever the effect of B is positive.
     eff["beneficial_letter"] = np.where(eff["delta_B_minus_A"] > 0, "B", "A")
@@ -551,7 +588,7 @@ def marginal_effects(X: np.ndarray, y: np.ndarray) -> pd.DataFrame:
     top, second = eff.iloc[0], eff.iloc[1]
     print(f"\n  leader: locus {int(top['locus'])} "
           f"({gene_label(int(top['locus']))})  "
-          f"delta={top['delta_B_minus_A']:.4f}  t={top['t']:.1f}  "
+          f"delta_B-A={top['delta_B_minus_A']:.4f}  t={top['t']:.1f}  "
           f"({top['abs_delta'] / second['abs_delta']:.2f}x runner-up)")
     return eff
 
@@ -1360,11 +1397,12 @@ def h_by_pairing(sfa, base_seqs, pi, loci, eta: float = 1.0,
     """h from a pair of targets differing only at the attributed locus.
 
     For two genotypes identical except at locus j, h_j is the same for both (it
-    depends only on x_{-j}), so
+    depends only on x_{-j}), so under the BY -> RM convention
 
-        h_j = phi_j(x with j = BY) - phi_j(x with j = RM)
+        h_j = phi_j(x with j = RM) - phi_j(x with j = BY)
 
-    exactly, since the two centering factors differ by (1 - p_j) - (-p_j) = 1.
+    exactly, since the two centering factors differ by p_j - (p_j - 1) = 1.
+    (The RM term comes first here; reversing it recovers the RM -> BY sign.)
     No division, and therefore valid at EVERY background including the parental
     deltas where the division route breaks. This is the route E4 needs.
 
@@ -1397,10 +1435,11 @@ def h_by_pairing(sfa, base_seqs, pi, loci, eta: float = 1.0,
     h = np.full((len(base_seqs), len(loci)), np.nan)
     for b, j, i_base, i_flip, base_is_by in meta:
         k = col[j]
+        # RM target minus BY target, per the BY -> RM convention above.
         if base_is_by:
-            h[b, k] = phi[i_base, k] - phi[i_flip, k]
-        else:
             h[b, k] = phi[i_flip, k] - phi[i_base, k]
+        else:
+            h[b, k] = phi[i_base, k] - phi[i_flip, k]
     return h
 
 
@@ -1841,7 +1880,7 @@ def e1_validate(args, ep, out_dir: Path) -> dict:
       3. covariance="diag" against the diagonal of covariance="full" -- the two
          builders share the block algebra but not the loop structure.
       4. h by division against h by pairing. This is a direct empirical test of
-         the biallelic factorization phi_i = (z_i - p_i) h_i that the whole
+         the biallelic factorization phi_i = (p_i - z_i) h_i that the whole
          script rests on, and it is the one check that would fail if the
          alphabet were not really binary.
     """
@@ -1956,6 +1995,129 @@ def e1_validate(args, ep, out_dir: Path) -> dict:
     return {"table": tbl, "scatter": scatter, "passed": bool(ok)}
 
 
+def brute_force_posterior_variance(sfa, x: str, pi) -> np.ndarray:
+    """Posterior variance of every phi_i by DENSE enumeration. Small L only.
+
+    Builds the (A^L, A^L) prior kernel and the m vector of each phi_i by
+    explicit subset enumeration, then forms
+
+        Var[phi_i] = m_i^T K m_i - (m_i^T K_{*X}) Gamma^{-1} (K_{X*} m_i).
+
+    Shares no code with the polynomial layer, so it is both the timing
+    reference for the brute-force variance curve and an independent check on
+    shap_values(covariance="diag").
+
+    Cost is ~(A^L)^2 for the kernel, which is why this curve is steeper than
+    the brute-force MEAN curve and stops sooner.
+    """
+    import itertools
+    L, A = sfa.L, sfa.A
+    alpha = sfa.alphabet
+    site = _to_np(sfa.ktc.site_kernels).astype(float)
+    pi_np = _to_np(pi).astype(float)
+    tv = [alpha.index(c) for c in x]
+
+    Sq = np.array(list(itertools.product(range(A), repeat=L)))
+    N = len(Sq)
+    K = np.ones((N, N))
+    for p in range(L):
+        K *= site[p][np.ix_(Sq[:, p], Sq[:, p])]
+
+    S = _to_np(sfa.ktc.S).astype(float)
+    Xtr = _to_np(sfa.ktc._train_x).reshape(-1, L, A)
+    tr = Xtr.argmax(axis=2)
+    Kstar = np.ones((N, tr.shape[0]))
+    for p in range(L):
+        Kstar *= site[p][np.ix_(Sq[:, p], tr[:, p])]
+
+    out = np.empty(L)
+    for i in range(L):
+        others = [p for p in range(L) if p != i]
+        m = np.zeros(N)
+        for r in range(len(others) + 1):
+            gw = (math.factorial(r) * math.factorial(L - r - 1)
+                  / math.factorial(L))
+            for T in itertools.combinations(others, r):
+                for inc in (True, False):
+                    fixed = list(set(T) | ({i} if inc else set()))
+                    sgn = gw if inc else -gw
+                    mask = np.ones(N, dtype=bool)
+                    for p in fixed:
+                        mask &= (Sq[:, p] == tv[p])
+                    wt = np.ones(N)
+                    for p in range(L):
+                        if p not in fixed:
+                            wt *= pi_np[p][Sq[:, p]]
+                    m[mask] += sgn * wt[mask]
+        prior = float(m @ K @ m)
+        z = (m @ Kstar) @ S
+        out[i] = prior - float(z @ z)
+    return out
+
+
+def e1_covariance_timing(args, sfa, pi, seqs, out_dir: Path) -> pd.DataFrame:
+    """Cost of the CROSS-TARGET covariance against the number of targets n.
+
+    A different independent variable from the L sweep, and deliberately a
+    separate panel. The per-target variance of phi_i is O(L) and involves no
+    target pairs at all; the covariance of an AGGREGATE such as epsilon_j is
+    O(n^2) because epsilon is an average over targets. Overlaying the two on
+    one axis would compare quantities that do not share an x-variable -- the
+    same category error as dividing a third-order contrast by a second-order
+    one.
+
+    This panel is what justifies subsampling targets for the epsilon
+    intervals: the cost is quadratic, so n = 400 is 2,500x cheaper than
+    n = 19,833, and the convergence table shows the answer is the same.
+    """
+    try:
+        from gkt_shap_covariance import ShapFunctionalCovariance
+    except ModuleNotFoundError:
+        print("  [skip] gkt_shap_covariance not importable; put it in "
+              "modules/ or scripts/")
+        return pd.DataFrame()
+
+    banner("E1c  cost of the cross-target covariance, against n")
+    sfc = ShapFunctionalCovariance(sfa.shap)
+    rng = np.random.default_rng(args.seed)
+    locus = args.cov_timing_locus
+    rows = []
+    for n in args.cov_timing_n:
+        n = int(min(n, len(seqs)))
+        idx = rng.choice(len(seqs), size=n, replace=False)
+        sub = [str(seqs[i]) for i in idx]
+        sync(sfa.device)
+        t0 = time.perf_counter()
+        _ = sfc.prior_matrix(sub, pi, locus, pair_block=args.cov_pair_block)
+        sync(sfa.device)
+        dt = time.perf_counter() - t0
+        pairs = n * (n + 1) / 2
+        rows.append({"n_targets": n, "seconds": dt, "pairs": pairs,
+                     "us_per_pair": dt / pairs * 1e6, "locus": locus})
+        print(f"  n={n:>5}  {dt:8.3f} s   ({pairs:.2e} pairs, "
+              f"{dt / pairs * 1e6:6.1f} us/pair)")
+
+    t = pd.DataFrame(rows)
+    if len(t) >= 2:
+        # Fit on the LARGEST sizes only. The smallest n is overhead-dominated
+        # -- 12 us/pair at n=50 against ~21 at n=200 -- and including it pulled
+        # the fitted exponent from 2.02 to 2.38 between two otherwise identical
+        # runs. Same correction as the enumeration cost model in E5.
+        tail = t.tail(max(2, min(3, len(t))))
+        e = float(np.polyfit(np.log(tail["n_targets"]),
+                             np.log(tail["seconds"]), 1)[0])
+        t.attrs["exponent"] = e
+        t.attrs["exponent_from_n"] = int(tail["n_targets"].iloc[0])
+        print(f"\n  fitted exponent in n: {e:.2f}   (theory: 2), from "
+              f"n >= {int(tail['n_targets'].iloc[0])}")
+        if abs(e - 2.0) > 0.4:
+            print("  !! still far from 2. Either the largest n is also "
+                  "overhead-dominated, or the pair block is being resized "
+                  "mid-sweep, which changes the constant between points.")
+    write_csv(t, out_dir / "E1_covariance_timing.csv")
+    return t
+
+
 def e1_timing(args, ep, out_dir: Path) -> pd.DataFrame:
     """Wall-clock: GKT vs brute-force enumeration, as a function of L.
 
@@ -1981,20 +2143,59 @@ def e1_timing(args, ep, out_dir: Path) -> pd.DataFrame:
         sync(sfa.device)
         t_gkt = (time.perf_counter() - t0) / args.timing_reps
 
+        # MEAN + POSTERIOR VARIANCE, same target, same L. This is the claim the
+        # GP buys over a point-prediction model: the uncertainty comes from the
+        # same machinery at a modest constant factor. covariance="diag" is the
+        # O(L) variance route (row 2 of the table); "full" would build the
+        # (L, L) grid and is a different question.
+        _ = sfa.shap.shap_values(x, pi, calc_covar=True, covariance="diag",
+                                 use_double=True)
+        sync(sfa.device)
+        t0 = time.perf_counter()
+        for _ in range(args.timing_reps):
+            _ = sfa.shap.shap_values(x, pi, calc_covar=True,
+                                     covariance="diag", use_double=True)
+        sync(sfa.device)
+        t_gkt_var = (time.perf_counter() - t0) / args.timing_reps
+
         t_bf = np.nan
+        t_bf_var = np.nan
         if L <= args.timing_bf_max_L:
             t0 = time.perf_counter()
             v = brute_force_subset_table(sfa, x, pi)
             _ = bf_shap_from_table(v, L)
             t_bf = time.perf_counter() - t0
 
+            # BRUTE-FORCE VARIANCE. Worse than the brute-force mean by more
+            # than a constant: the mean is a weighted sum over 2^(L-1) subsets,
+            # whereas the variance is a quadratic form over the whole A^L
+            # space, so it grows like (A^L)^2 = 4^L at A = 2 rather than 2^L.
+            # Measured to L = 13 offline the fitted base was 4.16, against a
+            # theoretical 4. Uncertainty is thus the part enumeration can least
+            # afford -- which is the point of the panel.
+        # SEPARATE, LOWER CAP for the variance. It needs the dense
+        # (A^L, A^L) prior kernel -- 4^L entries -- where the mean needs only a
+        # 2^L subset table. At L = 14 that kernel alone is 2.0 GiB (and 0.5 GiB
+        # at L = 13), so sharing --timing-bf-max-L would OOM or hang stage 1
+        # while the mean branch sails through. Default 10 = 8 MiB.
+        if L <= args.timing_bf_var_max_L:
+            t0 = time.perf_counter()
+            _ = brute_force_posterior_variance(sfa, x, pi)
+            t_bf_var = time.perf_counter() - t0
+
         rows.append({"L": L, "n_train": args.timing_n_train,
-                     "seconds_gkt": t_gkt, "seconds_brute_force": t_bf,
+                     "seconds_gkt": t_gkt,
+                     "seconds_gkt_variance": t_gkt_var,
+                     "seconds_brute_force": t_bf,
+                     "seconds_brute_force_variance": t_bf_var,
                      "terms_per_shap_value": float(2.0 ** (L - 1)),
-                     "total_terms": float(L) * 2.0 ** (L - 1)})
-        print(f"  L={L:>3}  GKT {t_gkt * 1e3:9.2f} ms   "
-              f"brute force {'--' if np.isnan(t_bf) else f'{t_bf:9.2f} s'}   "
-              f"({rows[-1]['total_terms']:.3e} subset terms)")
+                     "total_terms": float(L) * 2.0 ** (L - 1),
+                     "space_size": float(sfa.A) ** L})
+        print(f"  L={L:>3}  GKT mean {t_gkt * 1e3:8.2f} ms   "
+              f"+var {t_gkt_var * 1e3:8.2f} ms "
+              f"({t_gkt_var / max(t_gkt, 1e-12):4.1f}x)   "
+              f"BF mean {'--' if np.isnan(t_bf) else f'{t_bf:7.2f} s'}   "
+              f"BF var {'--' if np.isnan(t_bf_var) else f'{t_bf_var:7.2f} s'}")
         del sfa
 
     tbl = pd.DataFrame(rows)
@@ -2002,7 +2203,109 @@ def e1_timing(args, ep, out_dir: Path) -> pd.DataFrame:
     return tbl
 
 
-def _fig_e1(val: dict, timing: pd.DataFrame, out_dir: Path) -> None:
+def _draw_cost_panel(ax, timing: pd.DataFrame, fontsize: float = 6.6) -> None:
+    """Per-target wall-clock cost against L: four curves, four legend entries.
+
+    LEGEND CONVENTION. Each enumeration curve is ONE entry whose key shows the
+    marker and the dashed projection together, because the measured points and
+    the extrapolation are the same curve -- splitting them into "measured" and
+    "projected" entries implied two different methods and doubled the legend.
+    A proxy Line2D carries both.
+
+    FOUR CURVES, and the pairing is the point:
+      GKT mean            vs  enumeration mean      -- 2^L subsets
+      GKT mean + variance vs  enumeration variance  -- 4^L, the dense
+                                                       (A^L, A^L) prior kernel
+    The two GKT curves sit within a small constant factor of each other while
+    the two enumeration curves diverge from each other as well as from both, so
+    uncertainty is nearly free through the framework and is the part
+    enumeration can least afford.
+    """
+    from matplotlib.lines import Line2D
+    handles = []
+
+    g = timing.dropna(subset=["seconds_gkt"]).sort_values("L")
+    ax.plot(g["L"], g["seconds_gkt"], "o-", ms=3.5, color=C_ACC, lw=1.6)
+    handles.append(Line2D([], [], color=C_ACC, marker="o", ms=3.5, lw=1.6,
+                          label="GKT, mean"))
+
+    if "seconds_gkt_variance" in timing:
+        gv = timing.dropna(subset=["seconds_gkt_variance"]).sort_values("L")
+        if len(gv):
+            ax.plot(gv["L"], gv["seconds_gkt_variance"], "^-", ms=3.5,
+                    color=C_BY, lw=1.6)
+            handles.append(Line2D([], [], color=C_BY, marker="^", ms=3.5,
+                                  lw=1.6,
+                                  label="GKT, mean + posterior var"))
+
+    unit, L_meas = brute_force_unit_cost(timing)
+    b = timing.dropna(subset=["seconds_brute_force"]).sort_values("L")
+    if len(b):
+        ax.plot(b["L"], b["seconds_brute_force"], "s", ms=3.5, color=C_RM)
+        if np.isfinite(unit):
+            Ls = np.arange(int(b["L"].min()), int(g["L"].max()) + 1)
+            ax.plot(Ls, unit * Ls * 2.0 ** (Ls - 1), ":", color=C_RM, lw=1.6)
+        handles.append(Line2D([], [], color=C_RM, marker="s", ms=3.5, lw=1.6,
+                              ls=":", label="enumeration, mean (projected)"))
+
+    if "seconds_brute_force_variance" in timing:
+        bv = timing.dropna(subset=["seconds_brute_force_variance"]
+                           ).sort_values("L")
+        if len(bv):
+            C_VAR = "#7B3294"
+            ax.plot(bv["L"], bv["seconds_brute_force_variance"], "D", ms=3.5,
+                    color=C_VAR)
+            # 4^L, not 2^L: the variance is a quadratic form over the whole
+            # A^L space rather than a sum over subsets. Measured offline to
+            # L = 13 the fitted base was 4.16 against a theoretical 4.
+            unit_v = (float(bv["seconds_brute_force_variance"].iloc[-1])
+                      / 4.0 ** float(bv["L"].iloc[-1]))
+            Lv = np.arange(int(bv["L"].min()), int(g["L"].max()) + 1)
+            ax.plot(Lv, unit_v * 4.0 ** Lv, ":", color=C_VAR, lw=1.6)
+            handles.append(Line2D([], [], color=C_VAR, marker="D", ms=3.5,
+                                  lw=1.6, ls=":",
+                                  label="enumeration, variance (projected)"))
+
+    ax.set_yscale("log")
+    ax.set_xlabel("sequence length $L$")
+    ax.set_ylabel("seconds per genotype")
+    ax.legend(handles=handles, fontsize=fontsize, loc="upper left",
+              borderpad=0.3, labelspacing=0.3, handlelength=2.2)
+
+
+def _fig_covariance_cost(cov: pd.DataFrame, out_dir: Path) -> None:
+    """Cost of the cross-target covariance against n, at fixed L.
+
+    Its own figure rather than a panel of the composite: the composite's cost
+    panel is PER-TARGET cost against sequence length, and this is an aggregate
+    cost against the number of targets. Putting them on one axis would imply a
+    comparison that does not exist.
+    """
+    if cov is None or len(cov) < 2:
+        return
+    _style()
+    fig, ax = plt.subplots(figsize=(5.6, 4.2))
+    n = cov["n_targets"].to_numpy(dtype=float)
+    ax.plot(n, cov["seconds"], "o-", ms=4.5, color=C_ACC, lw=1.7,
+            label="GKT (measured)")
+    # n^2 guide anchored at the largest measured point, so the exponent can be
+    # read off the figure rather than taken on trust.
+    ref = float(cov["seconds"].iloc[-1]) / n[-1] ** 2
+    ax.plot(n, ref * n ** 2, "--", color="0.45", lw=1.2, label="$\\propto n^2$")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("targets $n$ in the aggregate")
+    ax.set_ylabel("seconds for the prior form $c^{T}Kc$")
+    e = cov.attrs.get("exponent")
+    ax.legend(fontsize=8, loc="upper left")
+    _panel(ax, "", "Cross-target covariance cost vs $n$"
+                   + (f",  fitted $n^{{{e:.2f}}}$" if e else ""))
+    fig.tight_layout()
+    save_fig(fig, out_dir, "fig_E1_covariance_cost")
+
+
+def _fig_e1(val: dict, timing: pd.DataFrame, out_dir: Path,
+            cov_timing: pd.DataFrame | None = None) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.2))
 
     ax = axes[0]
@@ -2039,25 +2342,158 @@ def _fig_e1(val: dict, timing: pd.DataFrame, out_dir: Path) -> None:
                  fontweight="bold")
 
     ax = axes[2]
-    g = timing.dropna(subset=["seconds_gkt"])
-    ax.plot(g["L"], g["seconds_gkt"], "o-", color=C_ACC, label="GKT")
-    b = timing.dropna(subset=["seconds_brute_force"])
-    if len(b):
-        ax.plot(b["L"], b["seconds_brute_force"], "s--", color=C_RM,
-                label="subset enumeration")
-        Ls = np.arange(int(b["L"].max()), int(g["L"].max()) + 1)
-        ref = float(b["seconds_brute_force"].iloc[-1])
-        ax.plot(Ls, ref * 2.0 ** (Ls - b["L"].max()), ":", color=C_RM, lw=1.0,
-                alpha=0.7, label="enumeration, extrapolated")
-    ax.set_yscale("log")
-    ax.set_xlabel("sequence length $L$")
-    ax.set_ylabel("seconds for all $L$ values of $\\phi_i$")
-    ax.set_title("C  cost", loc="left", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, frameon=False)
+    _draw_cost_panel(ax, timing)
 
     fig.suptitle("E1  the generalized kernel trick is exact, and exponentially "
                  "cheaper than the sum it evaluates", fontsize=12, y=1.03)
     save_fig(fig, out_dir, "fig_E1_validation")
+
+
+# =========================================================================== #
+# Compensating-locus decomposition, and the on-figure definitions
+# =========================================================================== #
+
+# Definitions written onto the figures. A reader should not have to find the
+# caption to learn what the plotted quantity is, and each is one line.
+EQ_H = r"$h_j = \phi_j\,/\,(p_j - z_j)$"
+EQ_EPS = (r"$\varepsilon_j = \overline{h_j}|_{\mathrm{ENA1}^{BY}}"
+          r" - \overline{h_j}|_{\mathrm{ENA1}^{RM}}$")
+
+# Loci that compensate for the deleterious ENA1 allele. Fixed rather than
+# re-derived from each run's ranking so the panel cannot silently change
+# meaning between runs; e3 prints the ranking and flags any disagreement.
+COMPENSATORS = ["MKT1", "HAL9", "PHO84"]
+
+
+def locus_of(gene: str) -> int:
+    for loc, g in GENE_BY_LOCUS.items():
+        if g == gene:
+            return int(loc)
+    raise KeyError(f"{gene} not in GENE_BY_LOCUS")
+
+
+def _eq(ax, text: str, loc: str = "lower right", fontsize: float = 8.0) -> None:
+    """Put a definition in a corner of the axes, unobtrusively."""
+    xy = {"lower right": (0.975, 0.03, "right", "bottom"),
+          "lower left": (0.025, 0.03, "left", "bottom"),
+          "upper right": (0.975, 0.97, "right", "top"),
+          "upper left": (0.025, 0.97, "left", "top")}[loc]
+    ax.text(xy[0], xy[1], text, transform=ax.transAxes, ha=xy[2], va=xy[3],
+            fontsize=fontsize,
+            bbox=dict(fc="white", ec="0.75", lw=0.5, alpha=0.92, pad=2.5))
+
+
+def compensator_table(seqs, h_ena1: np.ndarray) -> pd.DataFrame:
+    """h_ENA1 grouped by the allele combination at the compensating loci.
+
+    Uses only the genotype string and h_ENA1, so it has NO arithmetic
+    entanglement with f(x). That matters: an earlier panel plotted h_ENA1
+    against f(x) - phi_ENA1(x), intending to strip ENA1's own contribution so
+    any remaining trend came from the other loci. It removes the mean offset
+    but not the correlation -- the residual is sum_{i != ENA1} (p_i - z_i)
+    eps_i, built from precisely the loci that modulate h_ENA1 -- and the two
+    ENA1 groups came out with OPPOSITE slopes (+0.126 and -0.531). This panel
+    replaces it and states the mechanism directly.
+
+    Rows are ordered ascending in mean h. Under the BY -> RM convention that
+    puts the most EXPOSED combination on the left and the most BUFFERED on the
+    right, matching the distribution panel where tolerant genotypes sit at the
+    right-hand end.
+    """
+    d = pd.DataFrame({"seq": [str(s) for s in seqs], "h": np.asarray(h_ena1)})
+    for g in COMPENSATORS:
+        d[g] = d["seq"].str[locus_of(g)]
+    t = (d.groupby(COMPENSATORS)["h"].agg(n="size", mean="mean", sd="std")
+          .reset_index())
+    t["n_BY"] = sum((t[g] == BY_LETTER).astype(int) for g in COMPENSATORS)
+    t["label"] = t[COMPENSATORS].agg("".join, axis=1)
+    return t.sort_values("mean").reset_index(drop=True)
+
+
+def report_compensators(seqs, h_ena1: np.ndarray,
+                        e3_table: pd.DataFrame | None = None) -> pd.DataFrame:
+    t = compensator_table(seqs, h_ena1)
+    sub("h_ENA1 by allele state at the compensating loci")
+    print(f"  {'combination':>12}{'n_BY':>6}{'n':>9}{'mean h':>10}{'sd':>9}")
+    for _, r in t.iterrows():
+        print(f"  {r['label']:>12}{int(r['n_BY']):>6}{int(r['n']):>9,}"
+              f"{r['mean']:>10.4f}{r['sd']:>9.4f}")
+    rng = float(t["mean"].max() - t["mean"].min())
+    tot = float(np.max(h_ena1) - np.min(h_ena1))
+    print(f"\n  range across the {len(t)} combinations: {rng:.4f} of a total "
+          f"h_ENA1 range of {tot:.4f} ({rng / max(tot, 1e-12):.0%})")
+    mono = (t["n_BY"].is_monotonic_increasing
+            or t["n_BY"].is_monotonic_decreasing)
+    print(f"  monotone in the number of BY alleles: {mono}")
+
+    d = pd.DataFrame({"seq": [str(s) for s in seqs],
+                      "h": np.asarray(h_ena1)})
+    per = {}
+    for g in COMPENSATORS:
+        d[g] = d["seq"].str[locus_of(g)]
+        m = d.groupby(g)["h"].mean()
+        per[g] = float(m.get(BY_LETTER, np.nan) - m.get(RM_LETTER, np.nan))
+        print(f"  {g:<6} RM {m.get(RM_LETTER, np.nan):+.4f}  "
+              f"BY {m.get(BY_LETTER, np.nan):+.4f}   BY-RM {per[g]:+.4f}")
+    s_abs = sum(abs(v) for v in per.values())
+    print(f"\n  |per-locus differences| sum to {s_abs:.4f} against a full range "
+          f"of {rng:.4f}")
+    if abs(s_abs - rng) < 0.05 * max(rng, 1e-12):
+        print("  -> the three combine ADDITIVELY: no detectable three-way term, "
+              "consistent with E5 placing order 3 under 1% of variance")
+
+    if e3_table is not None and "epsilon_j" in e3_table:
+        sub("cross-check against E3's epsilon_j")
+        # These agree DIRECTLY under the BY -> RM convention: this panel's
+        # BY-minus-RM on h_ENA1 is E3's m_j, which equals eps_j exactly on a
+        # balanced design and approximately on the measured segregants.
+        d3 = e3_table.dropna(subset=["gene"]).set_index("gene")["epsilon_j"]
+        worst = 0.0
+        for g in COMPENSATORS:
+            if g in d3.index:
+                dd = abs(per[g] - float(d3[g]))
+                worst = max(worst, dd)
+                print(f"  {g:<6} this panel {per[g]:+.4f}   "
+                      f"E3 epsilon_j {float(d3[g]):+.4f}   diff {dd:.2e}")
+        print("  Both are mean(h_ENA1 | j = BY) - mean(h_ENA1 | j = RM).")
+        if worst > 5e-3:
+            print(f"  !! worst discrepancy {worst:.2e}. Some disagreement is "
+                  "expected on segregant targets from imperfect assortment; "
+                  "check the LD table if it approaches the epsilon values.")
+    return t
+
+
+def _panel_compensators(ax, seqs, h_ena1: np.ndarray, t: pd.DataFrame) -> None:
+    """Violins of h_ENA1, one per allele combination, ordered by mean."""
+    d = pd.DataFrame({"seq": [str(s) for s in seqs],
+                      "h": np.asarray(h_ena1)})
+    for g in COMPENSATORS:
+        d[g] = d["seq"].str[locus_of(g)]
+    d["label"] = d[COMPENSATORS].agg("".join, axis=1)
+    order = list(t["label"])
+    groups = [d.loc[d["label"] == lab, "h"].to_numpy() for lab in order]
+    if min(len(g) for g in groups) < 2:
+        print("  [note] a compensator combination has <2 genotypes; drawing "
+              "means only")
+        ax.plot(range(len(order)), t["mean"], "o-", color=C_RM, ms=5, lw=1.4)
+    else:
+        parts = ax.violinplot(groups, positions=range(len(order)), widths=0.82,
+                              showextrema=False, showmedians=True)
+        cmap = plt.get_cmap("Blues")
+        for pc, k in zip(parts["bodies"], t["n_BY"].to_numpy()):
+            pc.set_facecolor(cmap(0.30 + 0.20 * int(k)))
+            pc.set_alpha(0.95)
+            pc.set_linewidth(0)
+        if "cmedians" in parts:
+            parts["cmedians"].set_color("k")
+            parts["cmedians"].set_linewidth(1.1)
+        ax.plot(range(len(order)), t["mean"], "o-", color=C_RM, ms=3.5, lw=1.3,
+                zorder=6)
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(order, fontsize=8)
+    ax.set_xlabel("allele state at " + " / ".join(COMPENSATORS)
+                  + f"   ({RM_LETTER} = RM, {BY_LETTER} = BY)")
+    ax.set_ylabel("$h_{ENA1}$")
 
 
 # =========================================================================== #
@@ -2156,7 +2592,7 @@ def e2_substitution_landscape(args, sfa, ena1: int, pi, eff: pd.DataFrame,
                               seqs: list[str], out_dir: Path) -> dict:
     """phi -> h over the target set; the spread of h is the epistasis.
 
-    WHAT IS REPORTED. h_i = phi_i / (z_i - p_i), the orientation-fixed
+    WHAT IS REPORTED. h_i = phi_i / (p_i - z_i), the orientation-fixed
     substitution effect: positive means switching locus i from RM to BY raises
     predicted fitness. NOT phi_i. Under the biallelic factorization h_i is
     independent of locus i's own allele, so one number per (genotype, locus)
@@ -2216,7 +2652,7 @@ def e2_substitution_landscape(args, sfa, ena1: int, pi, eff: pd.DataFrame,
               "at every locus or the factorization does not hold; E3 and E4 "
               "would both be invalid.")
     else:
-        print("  -> the biallelic factorization phi_i = (z_i - p_i) h_i holds "
+        print("  -> the biallelic factorization phi_i = (p_i - z_i) h_i holds "
               "at L = 83")
 
     fx = np.array([predict(sfa, s) for s in seqs])
@@ -2297,28 +2733,52 @@ def e2_substitution_landscape(args, sfa, ena1: int, pi, eff: pd.DataFrame,
         "h_routes_max_abs_difference": d,
     }]), out_dir / "E2_throughput.csv")
 
+    # The compensating-locus decomposition, which E2 panel (c) and the
+    # composite figure both draw. Computed here so it appears in the run log
+    # and the CSV even if the figures are redrawn later.
+    t_comp = report_compensators(seqs, h_ena1, e3_table=None)
+    write_csv(t_comp, out_dir / "E2_compensator_decomposition.csv")
+
     res = {"h": h, "phi": phi, "indices": indices, "seqs": seqs, "fx": fx,
            "z": z, "ena1_state": ena1_state, "dose": dose, "tolerant": tol,
            "per_locus": per_locus, "per_genotype": per_geno,
            "h_ena1": h_ena1, "phi_ena1": phi[:, ena1],
-           "threshold": thr, "varying": vary,
+           "threshold": thr, "varying": vary, "compensators": t_comp,
            "n_shap_values": n_vals, "seconds": elapsed}
     _fig_e2(res, ena1, out_dir)
     return res
 
 
 def _fig_e2(res: dict, ena1: int, out_dir: Path) -> None:
-    """E2 diagnostic figure. Titles state WHAT is plotted, not what it means:
-    interpretation belongs in the paper's caption, where it can be qualified."""
+    """E2 figure, three panels.
+
+    Panel order is deliberate: (a) establishes that ENA1's effect varies at
+    all, (b) surveys which loci vary, and only then (c) zooms onto the three
+    that account for most of ENA1's variation. Showing the answer before the
+    question reads backwards, which is why the last two were swapped.
+
+    The dosage and background-fitness panels of earlier drafts are gone. Dosage
+    was non-monotone with r = -0.06, because the loci it counts interact with
+    ENA1 in opposite directions and summing them cancels the signal.
+    Background fitness gave the two ENA1 groups OPPOSITE slopes (+0.126 and
+    -0.531): subtracting phi_ENA1 removes the mean offset but not the
+    correlation, and the residual is built from exactly the loci that modulate
+    h_ENA1. Panel (c) replaces both and has no arithmetic entanglement with
+    f(x).
+    """
     _style()
-    h, h_ena1 = res["h"], res["h_ena1"]
-    fx, dose, tol = res["fx"], res["dose"], res["tolerant"]
+    h = res["h"]
+    h_ena1 = res["h_ena1"]
+    tol = np.asarray(res["tolerant"], dtype=bool)
     rm = res["ena1_state"] == "RM"
 
-    fig = plt.figure(figsize=(14.5, 8.0))
-    gs = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.28, left=0.06,
-                          right=0.985, top=0.88, bottom=0.13)
+    # 1:2 split on the top row -- panel (b) carries ~30 rotated locus labels
+    # and is illegible at half width; the histogram needs far less room.
+    fig = plt.figure(figsize=(15.0, 8.6))
+    gs = fig.add_gridspec(2, 3, hspace=0.52, wspace=0.26, left=0.065,
+                          right=0.985, top=0.87, bottom=0.14)
 
+    # ---- (a) distribution of h_ENA1 ----------------------------------- #
     ax = fig.add_subplot(gs[0, 0])
     bins = np.linspace(h_ena1.min(), h_ena1.max(), 60)
     ax.hist(h_ena1[rm & ~tol], bins=bins, color=C_NEU, alpha=0.85,
@@ -2327,32 +2787,14 @@ def _fig_e2(res: dict, ena1: int, out_dir: Path) -> None:
         ax.hist(h_ena1[tol], bins=bins, color=C_RM, alpha=0.9,
                 label="predicted RM-tolerant")
     ax.axvline(float(h_ena1.mean()), color="k", ls="--", lw=1.0)
-    ax.set_xlabel("$h_{ENA1}$")
-    ax.set_ylabel("genetic backgrounds")
-    _panel(ax, "a", "Distribution of $h_{ENA1}$")
-    ax.legend(fontsize=8, frameon=False)
+    ax.set_xlabel("$h_{ENA1}$   (effect of ENA1 BY$\\to$RM)")
+    ax.set_ylabel("genotypes")
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
+    _eq(ax, EQ_H, "lower left")
+    _panel(ax, "a", "Distribution of $h_{ENA1}$ across genotypes")
 
-    ax = fig.add_subplot(gs[0, 1])
-    ax.scatter(dose + np.random.default_rng(2).normal(0, 0.12, len(dose)),
-               h_ena1, s=3, color=C_NEU, alpha=0.15, lw=0)
-    dd = pd.DataFrame({"d": dose, "h": h_ena1}).groupby("d")["h"].mean()
-    ax.plot(dd.index, dd.values, color="k", lw=2.0, zorder=5)
-    ax.set_xlabel("beneficial alleles at other focal QTLs")
-    ax.set_ylabel("$h_{ENA1}$")
-    _panel(ax, "b", "$h_{ENA1}$ vs allele dosage")
-
-    ax = fig.add_subplot(gs[0, 2])
-    bg = fx - res["phi_ena1"]
-    ax.scatter(bg[~rm], h_ena1[~rm], s=3, color=C_BY, alpha=0.15, lw=0,
-               label="ENA1$^{BY}$")
-    ax.scatter(bg[rm], h_ena1[rm], s=3, color=C_RM, alpha=0.15, lw=0,
-               label="ENA1$^{RM}$")
-    ax.set_xlabel("background fitness $f(x)-\\phi_{ENA1}(x)$")
-    ax.set_ylabel("$h_{ENA1}$")
-    _panel(ax, "c", "$h_{ENA1}$ vs background fitness")
-    ax.legend(fontsize=8, frameon=False, markerscale=3)
-
-    ax = fig.add_subplot(gs[1, :])
+    # ---- (b) per-locus survey ----------------------------------------- #
+    ax = fig.add_subplot(gs[0, 1:3])
     pl = res["per_locus"]
     pl = pl[pl["is_focal_qtl"] | pl["varies_in_targets"]].head(30)
     order = [int(j) for j in pl["locus"]]
@@ -2368,20 +2810,27 @@ def _fig_e2(res: dict, ena1: int, out_dir: Path) -> None:
         parts["cmedians"].set_linewidth(1.1)
     ax.axhline(0, color="k", lw=0.7)
     ax.set_xticks(range(len(order)))
-    ax.set_xticklabels([gene_label(j) for j in order], rotation=90, fontsize=8)
+    ax.set_xticklabels([gene_label(j) for j in order], rotation=90,
+                       fontsize=7.5)
     for tick, j in zip(ax.get_xticklabels(), order):
         if j == ena1:
             tick.set_color(C_RM)
             tick.set_fontweight("bold")
     ax.set_ylabel("$h_i$")
     ax.set_xlabel("locus, ordered by $|$mean $h_i|$")
-    _panel(ax, "d", "Per-locus substitution effect across backgrounds")
+    _panel(ax, "b", "Per-locus effect across genotypes "
+                    "(width = epistasis; $\\pi$ fixed)")
 
-    fig.suptitle(f"E2   {h.shape[0]:,} genotypes $\\times$ {h.shape[1]} loci = "
+    # ---- (c) the three compensating loci ------------------------------ #
+    ax = fig.add_subplot(gs[1, :])
+    _panel_compensators(ax, res["seqs"], h_ena1, res["compensators"])
+    _panel(ax, "c", "$h_{ENA1}$ by allele state at the three compensating loci")
+
+    n = h.shape[0]
+    fig.suptitle(f"E2   {n:,} genotypes $\\times$ {h.shape[1]} loci = "
                  f"{h.size:,} exact first-order Shapley values",
                  fontsize=12, y=0.955)
     save_fig(fig, out_dir, "fig_E2_substitution_landscape")
-
 # =========================================================================== #
 # E3  --  compensating loci, from contrasts of the E2 matrix
 # =========================================================================== #
@@ -2395,7 +2844,7 @@ def design_blocks(seqs) -> dict[int, list[int]]:
     columns are identical (or exact complements) across every target. Any
     contrast conditioning on one of them is literally the same contrast as
     conditioning on any other, so:
-      * their delta_j values are 67 copies of one number, not 67 findings;
+      * their epsilon_j values are 67 copies of one number, not 67 findings;
       * m_j comes out IDENTICAL for all of them;
       * h_j is near-deterministic given the bit, so the design SEM collapses to
         ~1e-8 and |z| explodes into the hundreds, outranking real QTLs.
@@ -2421,33 +2870,33 @@ def design_blocks(seqs) -> dict[int, list[int]]:
 
 
 def e3_three_way(e2: dict, ena1: int, ident_loci, args) -> pd.DataFrame:
-    """Does delta_j depend on a THIRD locus? A genuine higher-order test.
+    """Does epsilon_j depend on a THIRD locus? A genuine higher-order test.
 
     WHY THIS EXISTS. An earlier version of E3 compared
-        delta_j = E[h_j | i=RM] - E[h_j | i=BY]
+        epsilon_j = E[h_j | i=RM] - E[h_j | i=BY]
     against
         m_j     = -(E[h_i | j=BY] - E[h_i | j=RM])
     and read agreement as evidence that the compensation is purely pairwise.
     THAT WAS WRONG. Both contrasts isolate the same sum over sets T containing
     BOTH i and j, and the Shapley weight beta_T/|T| is symmetric in i and j, so
     they differ only by an overall sign FOR ANY ORDER OF EPISTASIS. On a
-    balanced design delta_j == m_j is an identity, verified to 4e-16 against a
+    balanced design epsilon_j == m_j is an identity, verified to 4e-16 against a
     function with explicit third- and fourth-order terms. It tests design
     balance and implementation consistency, nothing about interaction order.
     (The 0.9954 seen on a 2,048-genotype subsample was imbalance, not structure.)
 
-    The real test, still using only first-order SHAP: condition delta_j on the
+    The real test, still using only first-order SHAP: condition epsilon_j on the
     allele at a third locus k.
 
-        gamma_{j,k} = delta_j(k = BY) - delta_j(k = RM)
+        gamma_{j,k} = epsilon_j(k = BY) - epsilon_j(k = RM)
 
-    If the epistasis among (ENA1, j, k) were purely pairwise, delta_j could not
+    If the epistasis among (ENA1, j, k) were purely pairwise, epsilon_j could not
     depend on k at all and gamma would be zero. A nonzero gamma is a genuine
     third-order effect.
     """
     h, z = e2["h"], e2["z"]
     rm = e2["ena1_state"] == "RM"
-    # Order by |delta_j| inside the function rather than trusting the caller's
+    # Order by |epsilon_j| inside the function rather than trusting the caller's
     # ordering: testing third-order structure on the loci with the smallest
     # interactions divides by a near-zero denominator and reports nonsense.
     cand = [int(j) for j in ident_loci]
@@ -2470,31 +2919,36 @@ def e3_three_way(e2: dict, ena1: int, ident_loci, args) -> pd.DataFrame:
             d_krm = hj[rm & ~kb].mean() - hj[~rm & ~kb].mean()
             rows.append({"locus_j": j, "gene_j": GENE_BY_LOCUS.get(j),
                          "locus_k": k, "gene_k": GENE_BY_LOCUS.get(k),
-                         "delta_j": base, "delta_j_given_k_BY": d_kby,
-                         "delta_j_given_k_RM": d_krm,
+                         "epsilon_j_ref": base, "epsilon_j_given_k_BY": d_kby,
+                         "epsilon_j_given_k_RM": d_krm,
                          "gamma_jk": d_kby - d_krm})
     tbl = pd.DataFrame(rows)
     if tbl.empty:
         return tbl
     tbl["abs_gamma"] = tbl["gamma_jk"].abs()
-    # Normalise against the LARGEST delta_j, not each locus's own. Dividing by
-    # its own delta reproduces exactly the small-denominator artifact that made
-    # |z| useless: a locus with delta = 4e-5 reports gamma as "800% of delta"
+    # Normalise against the LARGEST epsilon_j, not each locus's own. Dividing by
+    # its own epsilon reproduces exactly the small-denominator artifact that made
+    # |z| useless: a locus with epsilon = 4e-5 reports gamma as "800% of epsilon"
     # while being numerically irrelevant. The meaningful question is how large
     # the third-order term is next to the interactions actually being claimed.
     # Normalise against a quantity at the RIGHT scale: the spread of h_j
-    # across backgrounds, which is what both delta and gamma are decomposing.
-    # Ratios to delta_j (whether its own or the largest) compare orders 3 and 2
+    # across backgrounds, which is what both epsilon and gamma are decomposing.
+    # Ratios to epsilon_j (whether its own or the largest) compare orders 3 and 2
     # and are not interpretable.
     sd_h = {int(j): float(h[:, int(j)].std()) for j in tbl["locus_j"].unique()}
     tbl["sd_h_j"] = [sd_h[int(j)] for j in tbl["locus_j"]]
     tbl["gamma_over_sd_h"] = tbl["abs_gamma"] / tbl["sd_h_j"].replace(0, np.nan)
     tbl = tbl.sort_values("abs_gamma", ascending=False).reset_index(drop=True)
 
-    sub("third-order test: does delta_j depend on a third locus k?")
-    print("  gamma_(j,k) = delta_j(k=BY) - delta_j(k=RM). Exactly zero if the "
+    sub("third-order test: does epsilon_j depend on a third locus k?")
+    print("  gamma_(j,k) = epsilon_j(k=BY) - epsilon_j(k=RM). Exactly zero if the "
           "epistasis among (ENA1, j, k) is purely pairwise.")
-    cols = ["gene_j", "gene_k", "delta_j", "gamma_jk", "gamma_over_sd_h"]
+    tbl["label_j"] = [g if isinstance(g, str) and g else f"L{int(l)}"
+                      for g, l in zip(tbl["gene_j"], tbl["locus_j"])]
+    tbl["label_k"] = [g if isinstance(g, str) and g else f"L{int(l)}"
+                      for g, l in zip(tbl["gene_k"], tbl["locus_k"])]
+    cols = ["label_j", "label_k", "epsilon_j_ref", "gamma_jk",
+            "gamma_over_sd_h"]
     print(f"\n{tbl.head(12)[cols].to_string(index=False)}")
     print(f"\n  largest |gamma| = {float(tbl['abs_gamma'].max()):.6f}, "
           f"median {float(tbl['abs_gamma'].median()):.6f}, "
@@ -2502,18 +2956,18 @@ def e3_three_way(e2: dict, ena1: int, ident_loci, args) -> pd.DataFrame:
     print(f"  as a fraction of sd(h_j) across backgrounds: largest "
           f"{float(tbl['gamma_over_sd_h'].max()):.2f}")
 
-    # DO NOT compare gamma to delta_j. gamma is a THIRD-order contrast and
-    # delta a SECOND-order one, so their ratio has no interpretation -- on the
+    # DO NOT compare gamma to epsilon_j. gamma is a THIRD-order contrast and
+    # epsilon a SECOND-order one, so their ratio has no interpretation -- on the
     # yeast model it came out 41.8%, which sounds decisive and is not. Against
     # each order's own scale from E5 they are comparable: |gamma|/sd_3 = 1.72
-    # and |delta|/sd_2 = 1.09. The two statistics agree; the ratio between them
+    # and |epsilon|/sd_2 = 1.09. The two statistics agree; the ratio between them
     # does not mean what it looks like.
     print("\n  WHAT THIS DOES AND DOES NOT SHOW.")
     print("  gamma != 0 establishes that third-order terms among (ENA1, j, k) "
           "EXIST and are individually resolvable. It says nothing about how "
           "much of the variance they carry, because a contrast at order 3 is "
           "not on the same scale as one at order 2 -- comparing |gamma| to "
-          "|delta_j| mixes orders and inflates the apparent importance.")
+          "|epsilon_j| mixes orders and inflates the apparent importance.")
     print("  For the variance-weighted answer, read E5's order spectrum: it "
           "reports V_k for every k over the whole sequence space, so the "
           "question 'is the compensation pairwise?' is answered there by "
@@ -2526,7 +2980,7 @@ def e3_vs_raw_data(tbl: pd.DataFrame, inter: pd.DataFrame,
     """Quantitative comparison of the model's interactions against the raw data.
 
     The four-gene sign test is weak: it uses the prose of the source paper and
-    ignores the other eleven mapped loci. This compares the MODEL's delta_j
+    ignores the other eleven mapped loci. This compares the MODEL's epsilon_j
     against the MODEL-FREE conditional difference (eff_del - eff_ben) for every
     focal locus at once, which is a real regression rather than a checklist.
 
@@ -2544,13 +2998,13 @@ def e3_vs_raw_data(tbl: pd.DataFrame, inter: pd.DataFrame,
     if len(genes) < 4:
         return {}
     d = ref.loc[genes].to_numpy(dtype=float)
-    m = mod.loc[genes, "delta_rm_minus_by"].to_numpy(dtype=float)
+    m = mod.loc[genes, "epsilon_j"].to_numpy(dtype=float)
 
     sub(f"quantitative validation against the raw data ({len(genes)} focal loci)")
     r = float(np.corrcoef(d, m)[0, 1])
     slope = float(np.polyfit(d, m, 1)[0])
     agree = int((np.sign(d) == np.sign(m)).sum())
-    print(f"  model delta_j vs model-free (eff_RM - eff_BY): r = {r:+.4f}, "
+    print(f"  model epsilon_j vs model-free (eff_RM - eff_BY): r = {r:+.4f}, "
           f"slope = {slope:.3f}, signs agree {agree}/{len(genes)}")
     print("  (a slope below 1 is expected: the GP shrinks, and the raw "
           "difference carries measurement noise that inflates its spread)")
@@ -2570,10 +3024,10 @@ def e3_vs_raw_data(tbl: pd.DataFrame, inter: pd.DataFrame,
             for q in partners:
                 qg = GENE_BY_LOCUS.get(q)
                 if qg and qg in mod.index:
-                    extra += (f"  [partner {qg} model delta "
-                              f"{float(mod.loc[qg, 'delta_rm_minus_by']):+.5f}]")
+                    extra += (f"  [partner {qg} model epsilon "
+                              f"{float(mod.loc[qg, 'epsilon_j']):+.5f}]")
             print(f"    {g:<6} data {float(ref.loc[g]):+.5f}  model "
-                  f"{float(mod.loc[g, 'delta_rm_minus_by']):+.5f}  "
+                  f"{float(mod.loc[g, 'epsilon_j']):+.5f}  "
                   f"linked with {plabels}{extra}")
         print(f"\n  {n_bad_linked}/{len(bad)} of the disagreements are at loci "
               "inside an LD block.")
@@ -2588,6 +3042,105 @@ def e3_vs_raw_data(tbl: pd.DataFrame, inter: pd.DataFrame,
             "disagreements": sorted(bad), "n_disagree_linked": n_bad_linked}
 
 
+def _epsilon_posterior_intervals(args, sfa, ena1: int, pi, e2: dict,
+                                 tbl: pd.DataFrame, out_dir: Path):
+    """GP posterior s.d. of epsilon_j, with a convergence check in n.
+
+    Returns (tbl, convergence_table). tbl gains `epsilon_posterior_sd` and
+    `epsilon_posterior_converged`; the figure uses it only where converged.
+    """
+    try:
+        from gkt_shap_covariance import ShapFunctionalCovariance
+    except ModuleNotFoundError:
+        print("\n  [skip] gkt_shap_covariance not importable; epsilon "
+              "intervals need it in modules/ or scripts/")
+        return tbl, pd.DataFrame()
+
+    sub("posterior intervals on epsilon_j (subsampled, with convergence check)")
+    # E2 leaves the GPU nearly full: its polynomial slabs are ~2 GiB per target
+    # and the allocator holds the freed blocks. The covariance pass then asks
+    # for a few hundred MiB and dies. Release the cache first -- the module
+    # also shrinks its pair block to fit and retries on OOM, but starting from
+    # an empty pool avoids the retries entirely.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            before = torch.cuda.memory_reserved() / 2 ** 30
+            torch.cuda.empty_cache()
+            free = torch.cuda.mem_get_info()[0] / 2 ** 30
+            print(f"  released the allocator cache ({before:.1f} GiB reserved "
+                  f"before); {free:.1f} GiB free on device")
+    except Exception:                                              # noqa: BLE001
+        pass
+    sfc = ShapFunctionalCovariance(sfa.shap)
+    seqs = [str(x) for x in e2["seqs"]]
+    z = np.asarray(e2["z"])
+    sizes = sorted(set(int(n) for n in args.epsilon_posterior_n))
+    ident = tbl[tbl["design_identified"]] if "design_identified" in tbl else tbl
+    loci = [int(j) for j in ident["locus"].head(args.epsilon_posterior_top_k)]
+    print(f"  {len(loci)} loci x {len(sizes)} subsample sizes "
+          f"{sizes}; cost is O(n^2) per locus")
+
+    frames, sd_by_locus, conv_by_locus = [], {}, {}
+    for j in loci:
+        t0 = time.perf_counter()
+        try:
+            ct = sfc.epsilon_variance(seqs, z, pi, locus=j, focal_locus=ena1,
+                                      b_index=b_index(sfa.alphabet),
+                                      n_subsample=sizes, seed=args.seed)
+        except Exception as exc:                               # noqa: BLE001
+            msg = str(exc).split("\n")[0]
+            print(f"  !! locus {j} ({gene_label(j)}) failed: {msg}")
+            if "out of memory" in msg.lower():
+                print("     the module halves its pair block and retries, so "
+                      "reaching here means even 64 pairs did not fit. Free the "
+                      "device (run --stages 3 alone against a saved E2, or "
+                      "lower --shap-batch-size) or drop --cov-pair-block.")
+            continue
+        ct["gene"] = gene_label(j)
+        frames.append(ct)
+        last, prev = ct.iloc[-1], ct.iloc[-2] if len(ct) > 1 else None
+        sd_by_locus[j] = float(last["posterior_sd"])
+        # Converged if the last step barely moved. A ratio near 1/sqrt(2)
+        # instead would mean it is still behaving like an independent-sample
+        # standard error, and the subsampled interval would not be meaningful.
+        ratio = (float(last["posterior_sd"] / prev["posterior_sd"])
+                 if prev is not None and prev["posterior_sd"] > 0 else np.nan)
+        conv_by_locus[j] = bool(np.isfinite(ratio) and abs(ratio - 1.0) < 0.15)
+        print(f"  {gene_label(j):<6} posterior sd {sd_by_locus[j]:.5f}  "
+              f"last-step ratio {ratio:.3f}  "
+              f"{'converged' if conv_by_locus[j] else 'NOT converged'}  "
+              f"[{time.perf_counter() - t0:.1f} s]")
+
+    if not frames:
+        return tbl, pd.DataFrame()
+    conv = pd.concat(frames, ignore_index=True)
+    write_csv(conv, out_dir / "E3_epsilon_posterior_convergence.csv")
+
+    tbl["epsilon_posterior_sd"] = tbl["locus"].map(sd_by_locus)
+    tbl["epsilon_posterior_converged"] = tbl["locus"].map(
+        conv_by_locus).fillna(False)
+
+    n_ok = int(tbl["epsilon_posterior_converged"].sum())
+    print(f"\n  {n_ok}/{len(sd_by_locus)} loci converged in n")
+    if n_ok:
+        r = tbl[tbl["epsilon_posterior_converged"]]
+        med_design = float(r["epsilon_sem"].median())
+        med_post = float(r["epsilon_posterior_sd"].median())
+        print(f"  median design SEM {med_design:.2e} vs median posterior s.d. "
+              f"{med_post:.2e}  ({med_post / max(med_design, 1e-300):.1f}x)")
+        print("  The design SEM falls like 1/sqrt(n) and keeps falling as "
+              "targets are added; the posterior s.d. converges, because it "
+              "measures how well the DATA pin the function down, not how many "
+              "targets were averaged. The ratio is the size of the "
+              "understatement.")
+    else:
+        print("  !! nothing converged; the bars keep the design SEM and the "
+              "numbers are reported as exploratory. Raise "
+              "--epsilon-posterior-n before drawing conclusions.")
+    return tbl, conv
+
+
 def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
                          out_dir: Path, ld: pd.DataFrame | None = None,
                          inter: pd.DataFrame | None = None) -> dict:
@@ -2596,11 +3149,11 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
     THIS IS THE BIOLOGICAL RESULT, and it needs no attribution beyond E2's: it
     is two contrasts of the h matrix already in hand.
 
-        delta_j = mean(h_j | ENA1 = RM) - mean(h_j | ENA1 = BY)
+        epsilon_j = mean(h_j | ENA1 = RM) - mean(h_j | ENA1 = BY)
         m_j     = -[ mean(h_ENA1 | j = BY) - mean(h_ENA1 | j = RM) ]
 
-    delta_j is the source paper's Figure 4E quantity computed THROUGH THE MODEL:
-    positive means switching locus j from RM to BY buys more when ENA1 is in its
+    epsilon_j is the source paper's Figure 4E quantity computed THROUGH THE MODEL:
+    positive means losing the BY allele at locus j costs more when ENA1 is in its
     deleterious state. m_j is the same interaction seen from ENA1's side. For a
     model whose epistasis is purely pairwise the two are algebraically equal
     (both equal minus the mixed second difference), so
@@ -2614,7 +3167,7 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
     so as a statement about the actual landscape rather than as a global
     coefficient.
 
-    UNCERTAINTY, and an honest gap. The error bars on delta_j are the SEM across
+    UNCERTAINTY, and an honest gap. The error bars on epsilon_j are the SEM across
     the design, i.e. sampling error over genetic backgrounds. They are NOT a GP
     posterior interval: that would need the posterior covariance between
     attributions at two DIFFERENT targets, which is row 2 of the paper's table
@@ -2641,12 +3194,26 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
     for j in vary:
         hj = h[:, j]
         a, b = hj[rm], hj[~rm]                 # h_j in RM vs BY backgrounds
-        delta = a.mean() - b.mean()
+        # EPSILON, the epistatic coefficient between ENA1 and locus j:
+        #     eps_j = mean(h_j | ENA1 = BY) - mean(h_j | ENA1 = RM)
+        # BY first, under the BY -> RM convention for h. Positive eps_j means
+        # locus j matters MORE when ENA1 already carries its deleterious RM
+        # allele, i.e. j compensates.
+        #
+        # Note this is numerically identical to the epsilon_j of earlier drafts:
+        # h changed sign AND the subtraction order reversed, and the two
+        # cancel. MKT1 is +0.031 under both conventions.
+        eps = b.mean() - a.mean()
         sem = math.sqrt(a.var(ddof=1) / len(a) + b.var(ddof=1) / len(b))
 
+        # The same coefficient seen from ENA1's side. On a balanced design this
+        # equals eps_j exactly, for any order of epistasis -- see the
+        # design-balance note below. On the measured segregants the design is
+        # only approximately balanced, so expect close agreement rather than
+        # equality.
         by_j = z[:, j] == 1
         c, d_ = e2["h_ena1"][by_j], e2["h_ena1"][~by_j]
-        m = -(c.mean() - d_.mean())
+        m = c.mean() - d_.mean()
         m_sem = math.sqrt(c.var(ddof=1) / len(c) + d_.var(ddof=1) / len(d_))
 
         rows.append({
@@ -2655,8 +3222,8 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
             "is_focal_qtl": j in GENE_BY_LOCUS,
             "mean_h_j": hj.mean(), "sd_h_j": hj.std(),
             "mean_h_j_ena1_rm": a.mean(), "mean_h_j_ena1_by": b.mean(),
-            "delta_rm_minus_by": delta, "delta_sem": sem,
-            "delta_z": delta / sem if sem else np.nan,
+            "epsilon_j": eps, "epsilon_sem": sem,
+            "epsilon_z": eps / sem if sem else np.nan,
             "modulation_of_h_ena1": m, "modulation_sem": m_sem,
             "modulation_z": m / m_sem if m_sem else np.nan,
         })
@@ -2679,7 +3246,7 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
               "loci).")
         print("  On the enumerated landscape the background pseudo-locus bit "
               "flips ~67 loci at once, so those columns are identical across "
-              "every target. Their delta_j are copies of ONE contrast, their "
+              "every target. Their epsilon_j are copies of ONE contrast, their "
               "m_j are identical, and their design SEM collapses to ~1e-8, "
               "which sends |z| into the hundreds and outranks the real QTLs.")
         print(f"  {int(tbl['design_identified'].sum())} loci are individually "
@@ -2687,24 +3254,24 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
               "--targets segregants to identify all 83 (at the cost of relying "
               "on near-random assortment).")
 
-    tbl["abs_z"] = tbl["delta_z"].abs()
-    tbl["abs_delta"] = tbl["delta_rm_minus_by"].abs()
-    tbl["two_views_gap"] = (tbl["delta_rm_minus_by"]
+    tbl["abs_z"] = tbl["epsilon_z"].abs()
+    tbl["abs_epsilon"] = tbl["epsilon_j"].abs()
+    tbl["two_views_gap"] = (tbl["epsilon_j"]
                             - tbl["modulation_of_h_ena1"])
     # RANK BY EFFECT SIZE, NOT BY z. The design SEM is not sampling noise: for a
     # locus whose allele is pinned by the design, h_j is near-deterministic, so
-    # the SEM tends to zero and z diverges however negligible delta_j is. An
+    # the SEM tends to zero and z diverges however negligible epsilon_j is. An
     # earlier version sorted on |z| and produced a top-20 of deltas around 3e-5
     # with SEMs around 1e-8. Effect size first; z is kept as a significance
     # filter, not an ordering.
-    tbl = tbl.sort_values(["design_identified", "abs_delta"],
+    tbl = tbl.sort_values(["design_identified", "abs_epsilon"],
                           ascending=[False, False]).reset_index(drop=True)
     ident = tbl[tbl["design_identified"]]
-    scale_d = float(ident["abs_delta"].max()) if len(ident) else 0.0
-    tbl["delta_frac_of_max"] = tbl["abs_delta"] / max(scale_d, 1e-300)
+    scale_e = float(ident["abs_epsilon"].max()) if len(ident) else 0.0
+    tbl["epsilon_frac_of_max"] = tbl["abs_epsilon"] / max(scale_e, 1e-300)
     tbl["reportable"] = (tbl["design_identified"]
                          & (tbl["abs_z"] >= args.z_threshold)
-                         & (tbl["delta_frac_of_max"] >= args.min_delta_frac))
+                         & (tbl["epsilon_frac_of_max"] >= args.min_epsilon_frac))
 
     # ---- LD annotation: which of these splits are identified at all? ------ #
     blocks = ld_blocks(ld, thresh=args.ld_block_threshold) if ld is not None else {}
@@ -2732,36 +3299,36 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
                   "effect of the partner: if it is much weaker, the attribution "
                   "is probably safe.")
 
-    # The design SEM is NOT an uncertainty on delta_j in the usual sense. Each
+    # The design SEM is NOT an uncertainty on epsilon_j in the usual sense. Each
     # target is a deterministic function evaluation, not a draw from a
     # population, so the SEM falls as 1/sqrt(n_targets) and |z| diverges for any
-    # nonzero delta once enough genotypes are attributed. At n = 131,072 it
+    # nonzero epsilon once enough genotypes are attributed. At n = 131,072 it
     # reaches ~3e-5 and |z| exceeds 1000, which says how many genotypes were
     # attributed and nothing about confidence. The GP posterior s.d. of h
     # (~0.0018 here) is ~60x larger and is the uncertainty that matters.
     n_t = int(h.shape[0])
     if n_t >= 4096:
-        sub("how to read the uncertainty on delta_j")
+        sub("how to read the uncertainty on epsilon_j")
         print(f"  design SEM at {n_t:,} targets: median "
-              f"{float(tbl['delta_sem'].median()):.2e} -- do NOT report this as "
+              f"{float(tbl['epsilon_sem'].median()):.2e} -- do NOT report this as "
               "a confidence interval.")
         print("  Each target is a deterministic evaluation, not a sample, so "
               "this quantity shrinks as 1/sqrt(n_targets) without bound and |z| "
               "diverges for any nonzero effect. It measures the size of the "
               "design, not the strength of the evidence.")
-        print("  Report delta_j against the GP POSTERIOR s.d. of h (printed "
+        print("  Report epsilon_j against the GP POSTERIOR s.d. of h (printed "
               "below), and quote cross-replicate agreement separately as "
               "robustness. |z| on the design SEM should not appear in the "
               "paper.")
 
     print(f"\n  {int(tbl['reportable'].sum())} loci are reportable: "
           f"individually identified in the design, |z| >= "
-          f"{args.z_threshold:g}, and |delta| >= "
-          f"{args.min_delta_frac:.0%} of the largest")
+          f"{args.z_threshold:g}, and |epsilon| >= "
+          f"{args.min_epsilon_frac:.0%} of the largest")
     show = ["locus", "gene", "mean_h_j_ena1_rm", "mean_h_j_ena1_by",
-            "delta_rm_minus_by", "delta_sem", "delta_z",
+            "epsilon_j", "epsilon_sem", "epsilon_z",
             "modulation_of_h_ena1", "design_block_size"]
-    print("\n  top 20 identified loci, RANKED BY |delta| (effect size):")
+    print("\n  top 20 identified loci, RANKED BY |epsilon| (effect size):")
     print(f"{ident.head(20)[show].to_string(index=False)}")
 
     sub("consistency of the two views (pairwise-only prediction: gap == 0)")
@@ -2769,17 +3336,17 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
     # repeated dozens of times, which would dominate any correlation.
     two = ident[ident["abs_z"] >= args.z_threshold]
     if len(two) > 2:
-        rr = float(np.corrcoef(two["delta_rm_minus_by"],
+        rr = float(np.corrcoef(two["epsilon_j"],
                                two["modulation_of_h_ena1"])[0, 1])
         gap = float(two["two_views_gap"].abs().max())
-        sc = float(two["delta_rm_minus_by"].abs().max())
+        sc = float(two["epsilon_j"].abs().max())
         print(f"  over {len(two)} identified loci "
               "(the confounded block is excluded: it is one contrast repeated)")
-        print(f"  corr(delta, modulation) = {rr:+.4f}")
+        print(f"  corr(epsilon, modulation) = {rr:+.4f}")
         print(f"  worst |gap| = {gap:.5f} on a scale of {sc:.5f} "
               f"(relative {gap / max(sc, 1e-300):.3f})")
         print("  THIS IS A DESIGN-BALANCE CHECK, NOT A TEST OF INTERACTION "
-              "ORDER. delta_j == m_j is an IDENTITY on a balanced design for "
+              "ORDER. epsilon_j == m_j is an IDENTITY on a balanced design for "
               "any order of epistasis: both isolate the same sum over sets "
               "containing i and j, and the Shapley weight beta_T/|T| is "
               "symmetric in the two. Agreement therefore confirms the design "
@@ -2790,33 +3357,33 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
     sub("validation against the source paper's Figure 4E")
     d_by_gene = tbl.set_index("gene")
     n_ok, n_test = 0, 0
-    scale = float(tbl["delta_rm_minus_by"].abs().max())
-    for gene, want in PAPER_DELTA_SIGN.items():
+    scale = float(tbl["epsilon_j"].abs().max())
+    for gene, want in PAPER_EPSILON_SIGN.items():
         if gene not in d_by_gene.index:
             print(f"    [ -- ] {gene}: does not vary among these targets")
             continue
         r = d_by_gene.loc[gene]
-        dv, zz = float(r["delta_rm_minus_by"]), float(r["abs_z"])
+        dv, zz = float(r["epsilon_j"]), float(r["abs_z"])
         if want == 0:
             # "Deleterious with both alleles" does not mean zero interaction --
             # the raw data give HAP1 a conditional difference of 0.0164, which is
             # real. The meaningful test is that the model's interaction is SMALL
             # RELATIVE to the loci the paper calls conditional, so compare
             # against those rather than against zero.
-            cond = [g for g, w in PAPER_DELTA_SIGN.items() if w != 0
+            cond = [g for g, w in PAPER_EPSILON_SIGN.items() if w != 0
                     and g in d_by_gene.index]
-            ref = (float(d_by_gene.loc[cond, "delta_rm_minus_by"].abs().min())
+            ref = (float(d_by_gene.loc[cond, "epsilon_j"].abs().min())
                    if cond else scale)
             ok = abs(dv) < 0.75 * ref
             verdict = (f"weaker than the conditional loci "
-                       f"(|delta| < 0.75 x {ref:.5f})")
+                       f"(|epsilon| < 0.75 x {ref:.5f})")
         else:
             ok = np.sign(dv) == want and zz >= args.z_threshold
             verdict = "more work in RM" if want > 0 else "more work in BY"
         n_test += 1
         n_ok += bool(ok)
         print(f"    [{'PASS' if ok else 'FAIL'}] {gene:<6} "
-              f"delta={dv:+.5f} +- {float(r['delta_sem']):.5f} "
+              f"epsilon_j={dv:+.5f} +- {float(r['epsilon_sem']):.5f} "
               f"(|z|={zz:.1f})   expected: {verdict}   "
               f"[{PAPER_CONDITIONAL[gene]}]")
     print(f"  {n_ok}/{n_test} of the paper's predictions reproduced through the "
@@ -2848,16 +3415,57 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
           f"{np.nanmean(post_mean):.5f}")
     print(f"  median design sd / posterior sd: "
           f"{tbl['design_sd_over_posterior_sd'].median():.2f}")
-    # The honest significance statistic for delta_j.
+    # ---- posterior intervals on epsilon_j, if requested --------------- #
+    # OFF BY DEFAULT. The estimate is computed on a target SUBSAMPLE because
+    # the prior term is O(n^2) -- 3.9e8 pairs per locus at n = 19,833, about 13
+    # days. That is only legitimate if the posterior s.d. has CONVERGED in n,
+    # which is expected because posterior errors at nearby genotypes are
+    # correlated, so Var[mean over targets] tends to a nonzero limit rather
+    # than falling like 1/n. The design SEM currently on the error bars does
+    # fall like 1/sqrt(n) and so understates the real uncertainty without
+    # bound as targets are added.
+    #
+    # The convergence table is therefore printed, and the interval is adopted
+    # for the figure ONLY if the last two subsample sizes agree; otherwise the
+    # numbers are written to CSV and the bars keep the design SEM, with the
+    # disagreement reported.
+    if args.epsilon_posterior_n:
+        tbl, eps_cov = _epsilon_posterior_intervals(args, sfa, ena1, pi, e2,
+                                                    tbl, out_dir)
+
+    # The honest significance statistic for epsilon_j.
     pmean = float(np.nanmean(post_mean))
-    tbl["delta_over_posterior_sd"] = tbl["delta_rm_minus_by"] / max(pmean, 1e-300)
+    tbl["epsilon_over_posterior_sd"] = tbl["epsilon_j"] / max(pmean, 1e-300)
     top5 = tbl[tbl["design_identified"]].head(5)
-    print(f"\n  delta_j in units of the GP posterior s.d. of h "
-          f"({pmean:.5f}) -- the statistic to quote:")
+    # PREFER sd(epsilon) WHERE IT EXISTS. epsilon_j is an average over
+    # targets; sd(h) is the posterior s.d. at ONE target. Dividing an aggregate
+    # by a per-target scale is the same category error as dividing the
+    # third-order gamma by the second-order epsilon, and it OVERSTATES
+    # significance -- on the smoke run sd(epsilon) came out 22x the design SEM
+    # and roughly 1.7x sd(h), moving MKT1 from "10.3 posterior s.d." to 6.2.
+    if ("epsilon_posterior_sd" in tbl
+            and tbl["epsilon_posterior_sd"].notna().any()):
+        print("\n  epsilon_j against ITS OWN posterior s.d. -- the statistic "
+              "to quote:")
+        got = tbl[tbl["epsilon_posterior_sd"].notna()]
+        for _, r in got.head(8).iterrows():
+            sd_e = float(r["epsilon_posterior_sd"])
+            zz = float(r["epsilon_j"]) / sd_e if sd_e > 0 else float("nan")
+            conv = bool(r.get("epsilon_posterior_converged", False))
+            print(f"    {str(r['gene'] or gene_label(int(r['locus']))):<6} "
+                  f"epsilon {float(r['epsilon_j']):+.5f} +- {sd_e:.5f} "
+                  f"= {zz:+5.1f} sigma"
+                  f"{'' if conv else '   [NOT converged in n]'}")
+        print("  The ratio below divides instead by the per-target posterior "
+              "s.d. of h. It is kept because it needs no O(n^2) pass, but it "
+              "is not an interval on epsilon and reads larger than the truth.")
+
+    print(f"\n  epsilon_j in units of the GP posterior s.d. of h "
+          f"({pmean:.5f}) -- a PER-TARGET scale, not epsilon's own:")
     for _, r in top5.iterrows():
         print(f"    {str(r['gene'] or gene_label(int(r['locus']))):<6} "
-              f"delta {r['delta_rm_minus_by']:+.5f} = "
-              f"{r['delta_over_posterior_sd']:+6.1f} posterior s.d.")
+              f"epsilon {r['epsilon_j']:+.5f} = "
+              f"{r['epsilon_over_posterior_sd']:+6.1f} posterior s.d.")
     print("  a ratio well above 1 means the variation of h across backgrounds "
           "is real structure rather than posterior noise")
 
@@ -2869,6 +3477,12 @@ def e3_compensating_loci(args, sfa, ena1: int, pi, e2: dict,
     quant = ({} if inter is None else
              e3_vs_raw_data(tbl, inter, ld if ld is not None else pd.DataFrame(),
                             args.ld_block_threshold))
+
+
+    # Now that epsilon_j exists, redo the compensator cross-check: E2 could
+    # only print the decomposition, not compare it.
+    if "seqs" in e2 and "h_ena1" in e2:
+        report_compensators(e2["seqs"], e2["h_ena1"], e3_table=tbl)
 
     write_csv(tbl, out_dir / "E3_compensating_loci.csv")
     res = {"table": tbl, "posterior_sd": post_mean,
@@ -2894,27 +3508,30 @@ def _fig_e3(res: dict, args, ena1: int, out_dir: Path) -> None:
         gridspec_kw=dict(height_ratios=[1.25, 1.0, 1.15], hspace=0.55))
 
     ebar = (top["gp_posterior_sd_h"] if "gp_posterior_sd_h" in top
-            else top["delta_sem"])
-    ax1.bar(xs, top["delta_rm_minus_by"], yerr=ebar,
-            color=np.where(top["delta_rm_minus_by"] >= 0, C_RM, C_BY),
+            else top["epsilon_sem"])
+    ax1.bar(xs, top["epsilon_j"], yerr=ebar,
+            color=np.where(top["epsilon_j"] >= 0, C_RM, C_BY),
             width=0.74, error_kw=dict(lw=0.8, ecolor="0.25", capsize=2))
     ax1.axhline(0, color="k", lw=0.7)
     ax1.set_xticks(xs)
     ax1.set_xticklabels([])
     ax1.set_xlim(-0.7, len(top) - 0.3)
-    ax1.set_ylabel("$\\delta_j$")
-    _panel(ax1, "a", "$\\delta_j$ = mean $h_j\\,|\\,$ENA1$^{RM}$ $-$ mean "
-                     "$h_j\\,|\\,$ENA1$^{BY}$")
+    ax1.set_ylabel("$\\varepsilon_j$")
+    # BY FIRST. The code computes b.mean() - a.mean() with a = h_j|RM and
+    # b = h_j|BY; an earlier title read RM minus BY, i.e. the negation of what
+    # was plotted.
+    _panel(ax1, "a", "$\\varepsilon_j$ = mean $h_j\\,|\\,$ENA1$^{BY}$ $-$ mean "
+                     "$h_j\\,|\\,$ENA1$^{RM}$")
 
     ax2.bar(xs, top["mean_h_j"], yerr=top.get("gp_posterior_sd_h",
-                                              top["delta_sem"]),
+                                              top["epsilon_sem"]),
             color=C_NEU, width=0.74,
             error_kw=dict(lw=0.8, ecolor="0.25", capsize=2))
     ax2.axhline(0, color="k", lw=0.7)
     ax2.set_xticks(xs)
     ax2.set_xticklabels(labels, rotation=90, fontsize=8.5)
     for tick, g, l in zip(ax2.get_xticklabels(), labels, top["locus"]):
-        if g in PAPER_DELTA_SIGN:
+        if g in PAPER_EPSILON_SIGN:
             tick.set_fontweight("bold")
         if int(l) == ena1:
             tick.set_color(C_RM)
@@ -2926,8 +3543,14 @@ def _fig_e3(res: dict, args, ena1: int, out_dir: Path) -> None:
     three = res.get("three_way")
     if three is not None and len(three):
         t12 = three.head(12).iloc[::-1]
-        lab = [f"{g or '?'} $\\vert$ {k or '?'}"
-               for g, k in zip(t12["gene_j"], t12["gene_k"])]
+        # `g or '?'` does NOT catch a missing gene: pandas stores it as
+        # float('nan'), which is truthy, so the labels came out reading
+        # "HAL9 | nan". Fall back to the locus index, as everywhere else.
+        def _lab(gene, locus):
+            return gene if isinstance(gene, str) and gene else f"L{int(locus)}"
+        lab = [f"{_lab(g, lj)} $\\vert$ {_lab(k, lk)}"
+               for g, k, lj, lk in zip(t12["gene_j"], t12["gene_k"],
+                                       t12["locus_j"], t12["locus_k"])]
         ys = np.arange(len(t12))
         ax3.barh(ys, t12["gamma_jk"],
                  color=np.where(t12["gamma_jk"] >= 0, C_RM, C_BY), height=0.72)
@@ -2935,8 +3558,8 @@ def _fig_e3(res: dict, args, ena1: int, out_dir: Path) -> None:
         ax3.set_yticks(ys)
         ax3.set_yticklabels(lab, fontsize=7.5)
         ax3.set_xlabel("$\\gamma_{j,k}$")
-        _panel(ax3, "c", "$\\gamma_{j,k} = \\delta_j(k{=}$BY$)-"
-                         "\\delta_j(k{=}$RM$)$,  locus pair $j\\vert k$")
+        _panel(ax3, "c", "$\\gamma_{j,k} = \\epsilon_j(k{=}$BY$)-"
+                         "\\epsilon_j(k{=}$RM$)$,  locus pair $j\\vert k$")
     else:
         ax3.axis("off")
 
@@ -2959,7 +3582,7 @@ def e4_pi_sweep(args, sfa, ena1: int, out_dir: Path) -> dict:
 
     pi(t) = (1 - t) RM + t BY, uniformly across loci; t = 0 is the RM parental
     delta, t = 1 the BY parental delta, t = 0.5 uniform. h is extracted by
-    PAIRING, not division, because at the endpoints (z_j - p_j) = 0 for every
+    PAIRING, not division, because at the endpoints (p_j - z_j) = 0 for every
     locus matching the reference and the division route is undefined exactly
     there. The pairing route is exact at every t.
 
@@ -3081,14 +3704,10 @@ def make_paper_figure(e2: dict, e3: dict, e4: dict, ena1: int,
                       throughput: dict | None = None) -> Path | None:
     """The paper's main figure: cost first, then the three biological results.
 
-    Panel (a) is the claim the method rests on, so it leads. Its brute-force
-    curve is measured where enumeration is affordable and PROJECTED beyond that
-    from the measured per-subset-term rate (brute_force_unit_cost) -- projected,
-    not measured, and labelled as such in the legend.
-
-    The beneficial-allele dosage panel of earlier drafts is dropped: the
-    relationship is non-monotone with a y-range of 0.02 and |r| < 0.06, so it
-    occupied a sixth of the figure to show nothing.
+    Panel (c) is the compensating-locus decomposition, which replaced an earlier
+    h_ENA1-versus-background-fitness scatter; see _fig_e2 for why that panel was
+    not sound. The h and epsilon definitions are written onto the panels that
+    use them so the figure is readable without the caption.
     """
     if not (e2 and e3):
         print("  need E2 and E3 for the composite figure; skipping")
@@ -3097,87 +3716,56 @@ def make_paper_figure(e2: dict, e3: dict, e4: dict, ena1: int,
     _style()
 
     fig = plt.figure(figsize=(15.0, 8.6))
-    gs = fig.add_gridspec(2, 6, hspace=0.50, wspace=0.95, left=0.055,
-                          right=0.985, top=0.86, bottom=0.14)
+    gs = fig.add_gridspec(2, 6, hspace=0.52, wspace=0.95, left=0.055,
+                          right=0.985, top=0.86, bottom=0.15)
 
-    # ---- (a) cost ------------------------------------------------------- #
+    # ---- (a) cost ------------------------------------------------------ #
     ax = fig.add_subplot(gs[0, 0:2])
     if timing is not None and len(timing):
-        g = timing.dropna(subset=["seconds_gkt"]).sort_values("L")
-        ax.plot(g["L"], g["seconds_gkt"], "o-", ms=3.5, color=C_ACC, lw=1.6,
-                label="GKT (measured)")
-        unit, L_meas = brute_force_unit_cost(timing)
-        b = timing.dropna(subset=["seconds_brute_force"]).sort_values("L")
-        if len(b):
-            ax.plot(b["L"], b["seconds_brute_force"], "s-", ms=3.5, color=C_RM,
-                    lw=1.6, label=f"enumeration (measured, $L\\leq{L_meas}$)")
-        if np.isfinite(unit):
-            Ls = np.arange(int(b["L"].max()) if len(b) else 6,
-                           int(g["L"].max()) + 1)
-            proj = unit * Ls * 2.0 ** (Ls - 1)
-            ax.plot(Ls, proj, ":", color=C_RM, lw=1.6,
-                    label="enumeration (projected)")
-        if throughput:
-            ax.plot([throughput["L"]], [throughput["seconds_per_genotype"]],
-                    "*", ms=14, color="k", zorder=6,
-                    label=f"this work, $n$={throughput['n_condition']:,}")
-        ax.set_yscale("log")
-        ax.set_xlabel("sequence length $L$")
-        ax.set_ylabel("seconds per genotype\n(all $L$ values of $\\phi_i$)")
-        # Reference lines labelled at the RIGHT edge: at the left they sat
-        # underneath the legend.
-        x_hi = ax.get_xlim()[1]
-        for yr, lab in ((1.0, "1 s"), (3.156e7, "1 year"),
-                        (4.35e17, "age of the universe")):
-            if yr < ax.get_ylim()[1]:
-                ax.axhline(yr, color="0.82", lw=0.7, zorder=0)
-                ax.text(x_hi, yr, f"{lab} ", fontsize=6.5, color="0.45",
-                        va="bottom", ha="right")
-        ax.legend(fontsize=6.8, loc="upper left", borderpad=0.3,
-                  labelspacing=0.3, handlelength=1.6)
+        # Same drawer as the E1 figure, so the two cannot drift apart. The
+        # "this work" star of earlier drafts is gone: it marked a per-genotype
+        # rate from a different measurement (E2's throughput at n = 19,833)
+        # than the curve it sat on (a single target at n_train = 24), so the
+        # two were not comparable and the star implied they were.
+        _draw_cost_panel(ax, timing, fontsize=6.4)
     else:
         ax.axis("off")
         ax.text(0.5, 0.5, "run stage 1 for the cost panel", ha="center",
                 va="center", fontsize=9)
-    _panel(ax, "a", "Wall-clock cost")
+    _panel(ax, "a", "Per-target wall-clock cost")
 
-    # ---- (b) h_ENA1 distribution ---------------------------------------- #
+    # ---- (b) distribution --------------------------------------------- #
     ax = fig.add_subplot(gs[0, 2:4])
-    h = e2["h_ena1"]
+    h_ena1 = e2["h_ena1"]
+    tol = np.asarray(e2["tolerant"], dtype=bool)
     rm = e2["ena1_state"] == "RM"
-    tol = e2["tolerant"]
-    bins = np.linspace(h.min(), h.max(), 55)
-    ax.hist(h[rm & ~tol], bins=bins, color=C_NEU, alpha=0.85, label="all other")
+    bins = np.linspace(h_ena1.min(), h_ena1.max(), 55)
+    ax.hist(h_ena1[rm & ~tol], bins=bins, color=C_NEU, alpha=0.85,
+            label="all other")
     if tol.any():
-        ax.hist(h[tol], bins=bins, color=C_RM, alpha=0.9,
+        ax.hist(h_ena1[tol], bins=bins, color=C_RM, alpha=0.9,
                 label="predicted RM-tolerant")
-    ax.set_xlabel("$h_{ENA1}$")
-    ax.set_ylabel("genetic backgrounds")
-    ax.legend(fontsize=7.5)
+    ax.set_xlabel("$h_{ENA1}$   (effect of ENA1 BY$\\to$RM)")
+    ax.set_ylabel("genotypes")
+    ax.legend(fontsize=7.5, loc="upper left")
+    _eq(ax, EQ_H, "lower left", 7.5)
     _panel(ax, "b", "Distribution of $h_{ENA1}$")
 
-    # ---- (c) h_ENA1 vs background fitness ------------------------------- #
+    # ---- (c) compensating loci ---------------------------------------- #
     ax = fig.add_subplot(gs[0, 4:6])
-    bg = e2["fx"] - e2["phi_ena1"]
-    ax.scatter(bg[~rm], h[~rm], s=2.5, color=C_BY, alpha=0.14, lw=0,
-               label="ENA1$^{BY}$")
-    ax.scatter(bg[rm], h[rm], s=2.5, color=C_RM, alpha=0.14, lw=0,
-               label="ENA1$^{RM}$")
-    ax.set_xlabel("background fitness $f(x)-\\phi_{ENA1}(x)$")
-    ax.set_ylabel("$h_{ENA1}$")
-    ax.legend(fontsize=7.5, markerscale=3.5)
-    _panel(ax, "c", "$h_{ENA1}$ vs background fitness")
+    _panel_compensators(ax, e2["seqs"], h_ena1, e2["compensators"])
+    _panel(ax, "c", "$h_{ENA1}$ by compensating-locus state")
 
-    # ---- (d) compensating loci ------------------------------------------ #
+    # ---- (d) epsilon per locus ---------------------------------------- #
     ax = fig.add_subplot(gs[1, 0:3])
     t3 = e3["table"]
-    ident = t3[t3["design_identified"]] if "design_identified" in t3 else t3
+    ident = (t3[t3["design_identified"]] if "design_identified" in t3 else t3)
     t3f = ident.head(15)
     xs = np.arange(len(t3f))
     eb = (t3f["gp_posterior_sd_h"] if "gp_posterior_sd_h" in t3f
-          else t3f["delta_sem"])
-    ax.bar(xs, t3f["delta_rm_minus_by"], yerr=eb,
-           color=np.where(t3f["delta_rm_minus_by"] >= 0, C_RM, C_BY),
+          else t3f["epsilon_sem"])
+    ax.bar(xs, t3f["epsilon_j"], yerr=eb,
+           color=np.where(t3f["epsilon_j"] >= 0, C_RM, C_BY),
            width=0.74, error_kw=dict(lw=0.8, ecolor="0.25", capsize=2))
     ax.axhline(0, color="k", lw=0.7)
     ax.set_xticks(xs)
@@ -3185,19 +3773,20 @@ def make_paper_figure(e2: dict, e3: dict, e4: dict, ena1: int,
                         for g, l in zip(t3f["gene"], t3f["locus"])],
                        rotation=90, fontsize=8)
     for tick, g in zip(ax.get_xticklabels(), t3f["gene"]):
-        if g in PAPER_DELTA_SIGN:
+        if g in PAPER_EPSILON_SIGN:
             tick.set_fontweight("bold")
-    ax.set_ylabel("$\\delta_j$")
-    _panel(ax, "d", "$\\delta_j$ per locus   "
+    ax.set_ylabel("$\\varepsilon_j$")
+    _eq(ax, EQ_EPS, "lower right", 7.0)
+    _panel(ax, "d", "$\\varepsilon_j$ per locus   "
                     "(bold: reported in the source paper)")
 
-    # ---- (e) background sweep ------------------------------------------- #
+    # ---- (e) background sweep ----------------------------------------- #
     ax = fig.add_subplot(gs[1, 3:6])
     if e4:
         cmap = plt.get_cmap("tab20")
         for k, (loc, grp) in enumerate(e4["table"].groupby("locus")):
             grp = grp.sort_values("t")
-            is_e = loc == ena1
+            is_e = int(loc) == ena1
             ax.plot(grp["t"], grp["mean_h"], "-",
                     color=C_RM if is_e else cmap(k % 20),
                     lw=2.2 if is_e else 1.0, zorder=5 if is_e else 2,
@@ -3208,7 +3797,7 @@ def make_paper_figure(e2: dict, e3: dict, e4: dict, ena1: int,
         ax.legend(fontsize=7.5)
     else:
         ax.axis("off")
-    _panel(ax, "e", "$h_j$ vs background mixture $\\pi(t)$")
+    _panel(ax, "e", "$h_j$ vs reference background $\\pi(t)$")
 
     n = int(e2["n_shap_values"])
     fig.suptitle("Exact first-order Shapley attribution with GP posterior "
@@ -3216,8 +3805,6 @@ def make_paper_figure(e2: dict, e3: dict, e4: dict, ena1: int,
                  f"{n:,} Shapley values, each a $2^{{82}}$-term sum",
                  fontsize=12, y=0.955)
     return save_fig(fig, out_dir, "fig_paper_experiments")
-
-
 # =========================================================================== #
 # CLI
 # =========================================================================== #
@@ -3240,6 +3827,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--project-root", type=Path, default=None,
                    help="repo root (default: inferred; must contain modules/ "
                         "and epik/)")
+    g.add_argument("--no-log", action="store_true",
+                   help="do not tee stdout/stderr into the output directory. "
+                        "By default the run writes run.log and run.err there, "
+                        "so an interactive run leaves the same record a SLURM "
+                        "run gets from the scheduler.")
+    g.add_argument("--log-name", default="run.log",
+                   help="filename for the teed stdout inside --out-dir")
+    g.add_argument("--err-name", default="run.err",
+                   help="filename for the teed stderr inside --out-dir")
     g.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     g.add_argument("--gpu", action="store_true", help="use CUDA if available")
     g.add_argument("--require-gpu", action="store_true",
@@ -3319,20 +3915,55 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--timing-L", type=int, nargs="+",
                    default=[6, 8, 10, 12, 14, 16, 20, 30, 45, 60, 83])
     v.add_argument("--timing-bf-max-L", type=int, default=14)
+    v.add_argument("--timing-bf-var-max-L", type=int, default=10,
+                   help="largest L at which the BRUTE-FORCE posterior variance "
+                        "is measured. Lower than --timing-bf-max-L on purpose: "
+                        "the variance needs the dense (A^L, A^L) prior kernel, "
+                        "4^L entries against the mean's 2^L subset table, so "
+                        "the kernel is 8 MiB at L=10, 0.5 GiB at L=13 and 2.0 "
+                        "GiB at L=14. That steeper growth is itself the result "
+                        "the panel reports; it also means this curve must stop "
+                        "sooner.")
     v.add_argument("--timing-n-train", type=int, default=256)
     v.add_argument("--timing-reps", type=int, default=3)
+    v.add_argument("--cov-timing-n", type=int, nargs="+",
+                   default=[50, 100, 200, 400],
+                   help="target-set sizes for the cross-target covariance cost "
+                        "sweep at fixed L. This is the O(n^2) scaling, a "
+                        "DIFFERENT independent variable from the L sweep, so it "
+                        "gets its own panel in the E1 figure and does not go on "
+                        "the composite figure's per-target cost panel.")
+    v.add_argument("--cov-timing-locus", type=int, default=69,
+                   help="locus whose epsilon functional is timed (default MKT1)")
+    v.add_argument("--cov-pair-block", type=int, default=4096,
+                   help="target pairs per batched block. The unbatched route is "
+                        "155x slower at L=83 (458 ms against 3.0 ms per pair), "
+                        "so this is less a tuning knob than the difference "
+                        "between hours and minutes.")
 
     e = ap.add_argument_group("E2 / E3 targets")
-    e.add_argument("--targets", default="landscape",
+    e.add_argument("--targets", default="segregants",
                    choices=["landscape", "segregants"],
-                   help="'landscape' = the enumerated balanced design (16 loci "
-                        "vary); 'segregants' = the measured genotypes (all 83 "
-                        "vary, approximately balanced). Fitness plays no part "
-                        "in either selection.")
-    e.add_argument("--landscape-n", type=int, default=8192,
-                   help="targets to attribute; 0 = all. This dominates "
-                        "runtime: cost is O(L) convolutions on "
-                        "(batch, n_train, L) tensors per chunk.")
+                   help="'segregants' (default) = the measured genotypes the "
+                        "model was fitted to: all 83 loci vary, so E3 covers "
+                        "all of them, but the design is only APPROXIMATELY "
+                        "balanced and the contrasts lean on near-random "
+                        "assortment -- read the LD table alongside them. "
+                        "'landscape' = the enumerated factorial, exactly "
+                        "balanced but with only 17 degrees of freedom, so E3 "
+                        "covers the 16 mapped QTLs and the other 67 loci are "
+                        "perfectly confounded. Fitness plays no part in either "
+                        "selection.")
+    e.add_argument("--n-targets", "--landscape-n", dest="landscape_n",
+                   type=int, default=0,
+                   help="number of target genotypes to attribute; 0 (the "
+                        "default) means ALL of them -- all 19,833 measured "
+                        "segregants under --targets segregants, or all 131,072 "
+                        "enumerated genotypes under --targets landscape. "
+                        "Subsample only to iterate quickly: a cap silently "
+                        "changes what the figures describe, which is how an "
+                        "8,192-genotype run got mistaken for the full set. "
+                        "--landscape-n is accepted as an alias.")
     e.add_argument("--shap-batch-size", type=int, default=None,
                    help="target-batch size. Left unset, it is derived from the "
                         "real memory model (~2.2 GiB per target at L = 83, "
@@ -3350,9 +3981,18 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--three-way-top-j", type=int, default=4,
                    help="how many top compensating loci j to test for "
                         "dependence on a third locus k")
-    b.add_argument("--min-delta-frac", type=float, default=0.1,
+    b.add_argument("--epsilon-posterior-n", type=int, nargs="*", default=[],
+                   help="target subsample sizes for GP posterior intervals on "
+                        "epsilon_j, e.g. 100 200 400. EMPTY (the default) "
+                        "skips them and the error bars stay the design SEM. "
+                        "Cost is O(n^2) per locus: about 4 min per locus at "
+                        "n=400 and L=83, so start small and read the printed "
+                        "convergence table before scaling up.")
+    b.add_argument("--epsilon-posterior-top-k", type=int, default=3,
+                   help="how many identified loci get posterior intervals")
+    b.add_argument("--min-epsilon-frac", type=float, default=0.1,
                    help="a locus must reach this fraction of the largest "
-                        "|delta_j| to count as reportable. Guards against "
+                        "|epsilon_j| to count as reportable. Guards against "
                         "negligible effects passing on a collapsed design SEM.")
     b.add_argument("--ld-block-threshold", type=float, default=0.7,
                    help="|r| above which two loci are treated as one linked "
@@ -3370,6 +4010,44 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+class _Tee:
+    """Duplicate a stream to a file, so a terminal run leaves a log behind.
+
+    SLURM runs get run.out / run.err from the scheduler; an interactive run
+    leaves nothing, and this pipeline prints a great deal that is worth keeping
+    -- validation numbers, timings, convergence tables, the reasons a locus was
+    skipped. Rather than rely on the caller remembering to redirect, the script
+    writes its own copies into the output directory beside the CSVs they
+    describe.
+
+    Line-buffered and flushed on every write: a job that dies mid-run (the CUDA
+    OOM, for instance) must still leave everything up to the failure on disk.
+    """
+
+    def __init__(self, stream, path: Path):
+        self.stream = stream
+        self.file = open(path, "w", buffering=1)
+
+    def write(self, data):
+        self.stream.write(data)
+        self.file.write(data)
+        self.file.flush()
+        return len(data)
+
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+
+    def isatty(self):
+        return getattr(self.stream, "isatty", lambda: False)()
+
+    def close(self):
+        try:
+            self.file.close()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+
 def main() -> int:
     a = build_parser().parse_args()
     stages = {int(s) for s in str(a.stages).split(",") if s.strip() != ""}
@@ -3379,11 +4057,36 @@ def main() -> int:
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Install the log tee BEFORE anything is printed, so the revision banner --
+    # the first thing worth having in a log -- is captured too. Warnings from
+    # torch and gpytorch go to stderr, which is why both streams are teed.
+    _tees = []
+    if not a.no_log:
+        import atexit
+        for name, fname in (("stdout", a.log_name), ("stderr", a.err_name)):
+            t = _Tee(getattr(sys, name), out_dir / fname)
+            setattr(sys, name, t)
+            _tees.append((name, t))
+        def _restore():
+            for nm, tee in _tees:
+                setattr(sys, nm, tee.stream)
+                tee.close()
+        atexit.register(_restore)
+
     if a.threads:
         import torch
         torch.set_num_threads(int(a.threads))
 
     banner(f"GKT paper experiments -- stages {sorted(stages)}")
+    print(f"  script   {Path(__file__).resolve()}")
+    if _tees:
+        print(f"  log      {out_dir / a.log_name}")
+        print(f"  errors   {out_dir / a.err_name}")
+    print(f"  revision {SCRIPT_REVISION}")
+    print(f"           {REVISION_NOTES}")
+    print("  If the revision above is not what you expect, the file on this "
+          "machine is stale and every figure below will be in the old form.")
     print(f"  data     {a.data_dir}")
     print(f"  out      {out_dir}")
     print(f"  seed     {a.seed}")
@@ -3447,7 +4150,7 @@ def main() -> int:
           f"'{'A' if beneficial_is_b else 'B'}' = deleterious (RM)")
     if ("B" if beneficial_is_b else "A") != BY_LETTER:
         print(f"  !! polarity disagrees with BY_LETTER={BY_LETTER!r}. Every "
-              "RM/BY orientation below -- h, delta_j, and pi(t) in E4 -- would "
+              "RM/BY orientation below -- h, epsilon_j, and pi(t) in E4 -- would "
               "be inverted. Fix the constant before proceeding.")
         return 1
 
@@ -3524,7 +4227,18 @@ def main() -> int:
             return 1
 
     if 2 in stages:
-        e2 = e2_substitution_landscape(a, sfa, ena1, pi, eff, targets, out_dir)
+        # Cost of the cross-target covariance against n. Needs the real
+        # model, so it cannot live in stage 1, which builds small synthetic
+        # ones. Written to its own CSV and figure: it is a cost measurement,
+        # and its x-variable (number of targets) is not the composite cost
+        # panel's x-variable (sequence length).
+        if a.cov_timing_n:
+            cov_cost = e1_covariance_timing(
+                a, sfa, pi, [str(x) for x in df["seq"]], out_dir)
+            _fig_covariance_cost(cov_cost, out_dir)
+
+        e2 = e2_substitution_landscape(a, sfa, ena1, pi, eff, targets,
+                                       out_dir)
         if e2:
             summary["e2_h_ena1_mean"] = float(e2["h_ena1"].mean())
             summary["e2_h_ena1_sd"] = float(e2["h_ena1"].std())
@@ -3571,12 +4285,12 @@ def main() -> int:
     banner("how to read these outputs")
     print("  * Every reported quantity is built from FIRST-ORDER SHAP values. "
           "phi_i itself is kept only for the local-accuracy audit: in a "
-          "biallelic alphabet phi_i = (z_i - p_i) h_i, so the sign of phi_i is "
+          "biallelic alphabet phi_i = (p_i - z_i) h_i, so the sign of phi_i is "
           "the genotype read back, not a finding.")
     print("  * E2 panel D: the WIDTH of each violin is the epistasis. A wide "
           "violin means the locus's effect depends on the rest of the genome; "
           "a narrow one is additive.")
-    print("  * E3 is the biological result. delta_j > 0 with |z| above "
+    print("  * E3 is the biological result. epsilon_j > 0 with |z| above "
           f"{a.z_threshold:g} means locus j does measurably more work when ENA1 "
           "is in its RM state. Panel C checks the same interaction from ENA1's "
           "side: on the diagonal is purely pairwise, departures are "
@@ -3599,7 +4313,7 @@ def main() -> int:
                       else f"L{int(r['locus_j'])}")
                 print(f"      {gi} / {gj}   r={r['r']:+.3f}")
     print("  * Three checkpoint replicates exist (.1/.2/.3). Rerun with each; "
-          "any locus whose delta_j sign flips is not robust. Submit the SLURM "
+          "any locus whose epsilon_j sign flips is not robust. Submit the SLURM "
           "script with --array=1-3.")
     banner("done")
     return 0
