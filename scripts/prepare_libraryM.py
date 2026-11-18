@@ -18,11 +18,25 @@ column each (``pos_332``, ``pos_339``, ...). The only real work is:
     2. drop rows whose called residues are biologically unusable -- a stop codon
        ('*') or an uncalled/ambiguous residue ('X') -- so the alphabet stays the
        20 amino acids plus '-' (deletion, which IS meaningful here),
-    3. rename ph_mean -> y, ph_sd -> y_var.
+    3. rename ph_mean -> y, and convert ph_sd -> y_var by SQUARING it.
 
-The column order of the pos_* fields is preserved (genomic order), and a sidecar
-``*_positions.csv`` records seq-index -> RBD position so SHAP indices remain
-interpretable (index 0 = pos_332, etc.), the way GB1's indices mean 39/40/41/54.
+``ph_sd`` IS A STANDARD DEVIATION; ``y_var`` IS A VARIANCE
+----------------------------------------------------------
+This is the one non-obvious step. ``analysis.py`` forwards the ``y_var`` column to
+``EpiK.set_data(..., y_var=...)``, which becomes the fixed observation-noise VARIANCE
+of the GP likelihood. Passing ``ph_sd`` through unsquared therefore mis-states the
+noise on every point -- and not by a constant factor, so it distorts the relative
+weighting between precise and noisy genotypes, which changes the fitted
+hyperparameters and hence every downstream SHAP attribution.
+
+Direction of the error, if you ever see an old run: for ``ph_sd < 1`` the unsquared
+value OVERSTATES the noise (0.5 -> claimed 0.5, true 0.25), and for ``ph_sd > 1`` it
+UNDERSTATES it (2.0 -> claimed 2.0, true 4.0). Your data spans both sides of 1, so
+the bias is not even monotone across the dataset.
+
+Rows with a missing or non-positive ``ph_sd`` are dropped: GPyTorch's fixed-noise
+likelihood needs a finite non-negative variance per point, and a NaN there propagates
+silently into the Cholesky rather than raising.
 
 Backgrounds
 -----------
@@ -34,17 +48,18 @@ and any background x mutation structure shows up directly in the SHAP interactio
 If you later use a file that DOES carry a background/lineage column, stratify with
 ``--filter-col``/``--filter-val`` before analysis.
 
+The alphabet includes '-' (deletion), which is a real biological state here rather
+than padding. Note the consequence for the SHAP background: ``--background uniform``
+puts 1/A of the mass on '-' at EVERY position, including positions where a deletion
+was never observed, so attributions are measured against sequences that do not exist.
+``--background empirical`` uses the observed per-position residue frequencies and is
+the defensible default for this data.
+
 Usage
 -----
     python prepare_libraryM.py \
         --in  data/library_M/MABAa_ACE2_phenotype_data.csv \
         --out data/library_M/MABAa_ACE2.seqy.csv
-
-    # then feed the result straight to the existing analysis tool:
-    python scripts/analysis.py --data data/library_M/MABAa_ACE2.seqy.csv \
-        --kernel jenga --gpu --n-condition 5000 \
-        --interaction-order 2 --order-max 2 \
-        --out-dir output/libraryM_ACE2
 
 Notes
 -----
@@ -69,7 +84,7 @@ BAD_RESIDUES = {"*", "X"}
 
 def convert(in_path: Path, out_path: Path, *, keep_bad: bool = False,
             filter_col: str | None = None, filter_val: str | None = None,
-            drop_constant: bool = True) -> None:
+            drop_constant: bool = True, sd_is_variance: bool = False) -> None:
     df = pd.read_csv(in_path, index_col=0)
 
     # optional background/lineage stratification (not needed for the MABA* files,
@@ -98,6 +113,14 @@ def convert(in_path: Path, out_path: Path, *, keep_bad: bool = False,
     if len(df) < n0:
         print(f"[prep] dropped {n0 - len(df)} rows with missing ph_mean")
 
+    # drop rows with an unusable noise value: the GP's fixed-noise likelihood needs a
+    # finite, non-negative variance per point, and a NaN propagates into the Cholesky
+    # silently rather than raising.
+    n0 = len(df)
+    df = df[df["ph_sd"].notna() & (df["ph_sd"] >= 0)].copy()
+    if len(df) < n0:
+        print(f"[prep] dropped {n0 - len(df)} rows with missing/negative ph_sd")
+
     # build the aligned seq from the varying positions
     pos = df[pos_cols].astype(str)
 
@@ -121,25 +144,36 @@ def convert(in_path: Path, out_path: Path, *, keep_bad: bool = False,
         pos_cols = keep
         pos = pos[pos_cols]
 
-    # sanity: every cell must be a single character
+    # sanity: every cell must be a single character (also catches NaN -> 'nan')
     lens = pos.apply(lambda s: s.str.len()).to_numpy()
     if not np.all(lens == 1):
         bad_cols = [pos_cols[j] for j in range(len(pos_cols)) if not np.all(lens[:, j] == 1)]
         raise ValueError(f"non-single-character residues in columns {bad_cols}; "
-                         "unexpected encoding.")
+                         "unexpected encoding (missing values render as 'nan').")
 
     seq = pos.agg("".join, axis=1)
     L = len(pos_cols)
     alphabet = "".join(sorted(set("".join(seq.values))))
 
+    # ph_sd -> y_var: SQUARE it. See the module docstring -- analysis.py forwards this
+    # column as the GP's fixed observation-noise VARIANCE.
+    sd = df["ph_sd"].to_numpy(dtype=float)
+    y_var = sd if sd_is_variance else sd ** 2
+    if sd_is_variance:
+        print("[prep] --sd-is-variance: passing ph_sd through UNSQUARED "
+              "(only correct if that column is already a variance)")
+    else:
+        print(f"[prep] y_var = ph_sd**2   (sd: min={sd.min():.4f} max={sd.max():.4f} "
+              f"median={np.median(sd):.4f})")
+
     out = pd.DataFrame({
         "seq": seq.values,
         "y": df["ph_mean"].to_numpy(dtype=float),
-        "y_var": df["ph_sd"].to_numpy(dtype=float),
+        "y_var": y_var,
     })
 
-    # collapse exact-duplicate genotypes (same seq measured more than once):
-    # inverse-variance-ish average via simple mean of y, mean of y_var. Report only.
+    # exact-duplicate genotypes (same seq measured more than once) are left in place:
+    # they are legitimate repeated observations and the fixed-noise GP handles them.
     n_dupe = len(out) - out["seq"].nunique()
     if n_dupe:
         print(f"[prep] note: {n_dupe} rows share a seq with another row "
@@ -157,12 +191,17 @@ def convert(in_path: Path, out_path: Path, *, keep_bad: bool = False,
 
     print(f"[prep] wrote {out_path}  ({len(out)} sequences, L={L}, "
           f"alphabet='{alphabet}' A={len(alphabet)})")
+    if "-" in alphabet:
+        print("[prep] note: '-' (deletion) is in the alphabet. Prefer "
+              "--background empirical over uniform, which would put 1/A of the "
+              "background mass on '-' at every position.")
     print(f"[prep] wrote position map {sidecar}")
     print(f"[prep] y (ph_mean): min={out['y'].min():.3f} max={out['y'].max():.3f} "
           f"mean={out['y'].mean():.3f}")
     print("[prep] NEXT: python scripts/analysis.py "
           f"--data {out_path} --kernel jenga --gpu --n-condition 5000 "
-          "--interaction-order 2 --order-max 2 --out-dir output/libraryM")
+          f"--background empirical --interaction-order 2 --order-max {L} "
+          "--n-global-targets 300 --out-dir output/libraryM")
 
 
 def main():
@@ -178,6 +217,11 @@ def main():
     ap.add_argument("--keep-constant", action="store_true",
                     help="keep pos_ columns that are constant after filtering "
                          "(default: drop them, since they carry no information)")
+    ap.add_argument("--sd-is-variance", action="store_true",
+                    help="treat the ph_sd column as ALREADY being a variance and pass it "
+                         "through unsquared. Default (off) squares it, which is correct "
+                         "for the Desai-lab files where the column is a standard "
+                         "deviation. Only set this if you have verified otherwise.")
     ap.add_argument("--filter-col", default=None,
                     help="optional column to stratify on (e.g. a background/lineage "
                          "column, if present) before converting")
@@ -191,7 +235,8 @@ def main():
     convert(Path(args.in_path), Path(args.out_path),
             keep_bad=args.keep_bad,
             filter_col=args.filter_col, filter_val=args.filter_val,
-            drop_constant=(not args.keep_constant))
+            drop_constant=(not args.keep_constant),
+            sd_is_variance=args.sd_is_variance)
 
 
 if __name__ == "__main__":

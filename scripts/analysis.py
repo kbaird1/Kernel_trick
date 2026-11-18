@@ -791,22 +791,34 @@ class SequenceFunctionAnalysis:
         all_T = positions + inter_tuples
         want_cov = self.cfg.local_covariance
 
-        def diag_sd(cov):
-            # posterior sd of each term = sqrt of the covariance diagonal (clamped
-            # to guard tiny negative round-off before the sqrt).
-            d = torch.diagonal(cov)
-            return _to_np(torch.sqrt(torch.clamp(d, min=0.0)))
+        def var_sd(var):
+            # posterior sd of each term = sqrt of its variance (clamped to guard tiny
+            # negative round-off). Input is the 1-D per-term variance vector returned
+            # by covariance="diag".
+            return _to_np(torch.sqrt(torch.clamp(var, min=0.0)))
 
         if want_cov:
-            phi, _ = shap.shap_values(tgt, pi, indices=list(range(self.L)), calc_covar=True)
-            sii_T, sii, sii_cov = shap.shap_interaction_values(
-                tgt, pi, interactions=all_T, normalize="sii", calc_covar=True)
-            fs_T, fs, fs_cov = shap.faith_shap_values(
+            # covariance="diag": each method returns per-term VARIANCES (1-D), not a
+            # full matrix -- all these local tables consume is sqrt(diag). For
+            # shap_values / shap_interaction_values / dividend_values that makes the
+            # covariance O(n) in tuples instead of O(n^2). faith_shap_values is the
+            # EXCEPTION: with a non-empty Eq. 16 tail its variance needs off-diagonal
+            # dividend covariance, so the full grid over div_tuples is still built
+            # (correct, but no asymptotic saving -- see _warn_faith_covariance_cost).
+            # Default everywhere is still "full"; we opt in explicitly here.
+
+            phi, pvar = shap.shap_values(tgt, pi, indices=list(range(self.L)),
+                                         calc_covar=True, covariance="diag")
+            pos_sd = var_sd(pvar)
+            sii_T, sii, sii_var = shap.shap_interaction_values(
+                tgt, pi, interactions=all_T, normalize="sii",
+                calc_covar=True, covariance="diag")
+            fs_T, fs, fs_var = shap.faith_shap_values(
                 tgt, pi, order_max=ell, interactions=all_T, calc_covar=True,
-                order_cap=self._faith_cap)
-            dv_T, dv, dv_cov = shap.dividend_values(
-                tgt, pi, interactions=all_T, calc_covar=True)
-            sii_sd, fs_sd, dv_sd = diag_sd(sii_cov), diag_sd(fs_cov), diag_sd(dv_cov)
+                covariance="diag", order_cap=self._faith_cap)
+            dv_T, dv, dv_var = shap.dividend_values(
+                tgt, pi, interactions=all_T, calc_covar=True, covariance="diag")
+            sii_sd, fs_sd, dv_sd = var_sd(sii_var), var_sd(fs_var), var_sd(dv_var)
         else:
             phi = shap.shap_values(tgt, pi, indices=list(range(self.L)))
             sii_T, sii = shap.shap_interaction_values(
@@ -815,11 +827,11 @@ class SequenceFunctionAnalysis:
                 tgt, pi, order_max=ell, interactions=all_T,
                 order_cap=self._faith_cap)
             dv_T, dv = shap.dividend_values(tgt, pi, interactions=all_T)
-            sii_sd = fs_sd = dv_sd = None
+            pos_sd = sii_sd = fs_sd = dv_sd = None
 
         # each table is (tuples, value, sd)  -- sd is None when covariance is off
         return {
-            "shapley_positions": (list(range(self.L)), _to_np(phi), None),
+            "shapley_positions": (list(range(self.L)), _to_np(phi), pos_sd),
             "sii": (sii_T, _to_np(sii), sii_sd),
             "faith_shap": (fs_T, _to_np(fs), fs_sd),
             "dividend": (dv_T, _to_np(dv), dv_sd),
@@ -839,9 +851,11 @@ class SequenceFunctionAnalysis:
 
         Faith-Shap: at ``ell >= L`` (the tail is empty) Faith-Shap == the dividends,
         so its summary is read straight off the already-computed batched dividend
-        matrix -- exact and free. Only the genuinely truncated case (``ell < L``) still
-        routes through the per-target ``global_faith_shap_summary`` (no vectorized
-        tail path yet); that case is gated tractable by ``_preflight_faith``.
+        matrix -- exact and free. The genuinely truncated case (``ell < L``) uses
+        ``faith_shap_values_batch_vectorized``, which computes every needed dividend
+        once across the target chunk and applies the target-independent Eq. 16 map;
+        the tail is gated tractable by ``_preflight_faith``. (The per-target
+        ``global_faith_shap_summary`` is no longer called from here.)
         """
         shap, pi = self.shap, self.pi
         out = {}
@@ -935,29 +949,39 @@ class SequenceFunctionAnalysis:
         fs_sd = np.zeros(len(all_T))
         dv_sd = np.zeros(len(all_T))
 
-        def diag_sd(cov):
-            d = torch.diagonal(cov)
-            return _to_np(torch.sqrt(torch.clamp(d, min=0.0)))
+        def var_sd(var):
+            # sd from the per-term variance vector returned by covariance="diag".
+            return _to_np(torch.sqrt(torch.clamp(var, min=0.0)))
 
         n = len(xs)
         print(f"[global] computing posterior covariance over {n} targets "
               "(--global-covariance)")
         # verbose: tick every 25 targets (finer than the default every-100) with a
         # running rate + ETA, so this long per-target loop shows liveness.
+        # covariance="diag": only per-term variances are needed here (we sum sqrt(diag)
+        # across targets), so the first-order / SII / dividend calls are O(n) tuples
+        # instead of O(n^2) -- the diagonal-R path. The faith_shap call is the exception
+        # when its Eq. 16 tail is non-empty (ell < L, cap > ell): its variance genuinely
+        # needs the off-diagonal dividend covariance, so the full grid over div_tuples is
+        # built ONCE PER TARGET here. _preflight_faith warns about that before the fit.
+        # Default elsewhere is still "full".
         t0 = time.time()
         tick = 25 if self.cfg.verbose else 100
         for k, x in enumerate(xs, 1):
-            _, pcov = shap.shap_values(x, pi, indices=list(range(self.L)), calc_covar=True)
-            _, _, scov = shap.shap_interaction_values(
-                x, pi, interactions=all_T, normalize="sii", calc_covar=True)
-            _, _, fcov = shap.faith_shap_values(
+            _, pvar = shap.shap_values(x, pi, indices=list(range(self.L)),
+                                       calc_covar=True, covariance="diag")
+            _, _, svar = shap.shap_interaction_values(
+                x, pi, interactions=all_T, normalize="sii",
+                calc_covar=True, covariance="diag")
+            _, _, fvar = shap.faith_shap_values(
                 x, pi, order_max=ell, interactions=all_T, calc_covar=True,
-                order_cap=self._faith_cap)
-            _, _, dcov = shap.dividend_values(x, pi, interactions=all_T, calc_covar=True)
-            pos_sd += diag_sd(pcov)
-            sii_sd += diag_sd(scov)
-            fs_sd += diag_sd(fcov)
-            dv_sd += diag_sd(dcov)
+                covariance="diag", order_cap=self._faith_cap)
+            _, _, dvar = shap.dividend_values(x, pi, interactions=all_T,
+                                              calc_covar=True, covariance="diag")
+            pos_sd += var_sd(pvar)
+            sii_sd += var_sd(svar)
+            fs_sd += var_sd(fvar)
+            dv_sd += var_sd(dvar)
             if k % tick == 0 or k == n:
                 if self.cfg.verbose:
                     rate = k / max(1e-9, time.time() - t0)
@@ -1244,6 +1268,7 @@ class SequenceFunctionAnalysis:
                       f"dividends for Faith-Shap (ell={ell}, L={L}); this will be slow. "
                       "Lower --order-cap for a faster pass.")
             self._faith_cap = cap
+            self._warn_faith_covariance_cost(ell, cap)
             return
 
         # cap not given on a truncated run: the exact tail runs to L.
@@ -1253,6 +1278,7 @@ class SequenceFunctionAnalysis:
                       f"~{n_exact:,} superset dividends (under threshold, kept exact)",
                       level="debug")
             self._faith_cap = None          # cheap enough; keep it exact (cap = L)
+            self._warn_faith_covariance_cost(ell, L)
             return
         print(f"[error] truncated Faith-Shap (order_max={ell} < L={L}) with no "
               f"--order-cap would enumerate ~{n_exact:,} higher-order superset "
@@ -1263,7 +1289,48 @@ class SequenceFunctionAnalysis:
               "tail and are always available.")
         sys.exit(1)
 
+    def _warn_faith_covariance_cost(self, ell: int, cap: int) -> None:
+        """Warn when Faith-Shap POSTERIOR COVARIANCE is O(n_div^2), not O(n_div).
 
+        covariance="diag" is an O(n) win for SII / dividends / first-order: the variance
+        needs only the n same-tuple products, so the n x n grid is never built. Faith-Shap
+        is the exception. Its covariance is ``M cov_a M^T`` and ``M`` MIXES dividend
+        tuples, so ``Var(E_S)`` reads OFF-DIAGONAL entries of the dividend covariance
+        whenever the Eq. (16) tail is non-empty. The shap module therefore builds the full
+        ``cov_a`` over ``div_tuples`` in that case -- correct, but with no asymptotic
+        saving -- and ``div_tuples`` is the reported tuples PLUS every superset up to
+        ``cap``, so it is much larger than the reported set.
+
+        This is only a warning: the numbers are right either way. It exists because the
+        failure mode is a run that looks hung rather than one that errors, and because
+        --global-covariance pays this cost once PER TARGET.
+        """
+        from math import comb
+        cfg, L = self.cfg, self.L
+        if not (cfg.local_covariance or cfg.global_covariance):
+            return
+        if ell >= L or cap <= ell:
+            return                          # tail empty => M is a selection matrix => cheap
+
+        n_report = L + sum(comb(L, k) for k in range(2, min(cfg.interaction_order, L) + 1))
+        n_super = sum(comb(L, k) for k in range(ell + 1, cap + 1))
+        n_div = n_report + n_super
+        where = []
+        if cfg.local_covariance:
+            where.append(f"{len(self._resolve_local_targets())} local target(s)")
+        if cfg.global_covariance:
+            n_g = cfg.n_global_targets
+            where.append(f"--global-covariance ({n_g} targets, PER TARGET)")
+        print(f"[warn] Faith-Shap covariance with a non-empty tail (ell={ell} < L={L}, "
+              f"cap={cap}) is O(n_div^2), not O(n_div): Var(E_S) needs the off-diagonal "
+              f"dividend covariance, so the full ~{n_div:,}x{n_div:,} grid is built for "
+              f"{' and '.join(where)}.\n"
+              f"       covariance='diag' still returns correct variances, it just cannot "
+              f"skip that grid here (SII / dividend / first-order diag ARE O(n)).\n"
+              f"       To make it cheap: --order-max {L} (Faith-Shap == dividends), or "
+              f"--order-cap {ell} (empties the tail -- but then Faith-Shap degenerates to "
+              f"the dividends for the reported tuples, so only do this if that is what you "
+              f"want). Or drop --global-covariance.")
 # =========================================================================== #
 # small helpers  (shared with downstream drivers)
 # =========================================================================== #
